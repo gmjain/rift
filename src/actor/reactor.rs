@@ -4571,7 +4571,13 @@ impl Reactor {
                     self.try_focus_or_warp_without_raise(Some(space), &mut focus_window)
                 }
             } else if let Some(space) = pending_refocus_space.take() {
-                if let Some(wid) = self.visible_focus_candidate_in_active_workspace(space, None) {
+                // Refocus restores focus on the display that has it; it must not activate a
+                // window on another display (that moves the active display and the menu bar).
+                if self.workspace_command_space().is_some_and(|active| active != space) {
+                    false
+                } else if let Some(wid) =
+                    self.visible_focus_candidate_in_active_workspace(space, None)
+                {
                     focus_window = Some(wid);
                     false
                 } else if !self.is_in_drag() {
