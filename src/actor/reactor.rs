@@ -46,6 +46,8 @@ mod SpaceEventHandler {
 }
 
 #[cfg(test)]
+mod raise_storm_tests;
+#[cfg(test)]
 mod tests;
 
 use std::cell::RefCell;
@@ -3988,6 +3990,20 @@ impl Reactor {
                 if self.layout_manager.layout_engine.focused_window() == Some(wid)
         );
         self.prepare_refocus_before_removal(&event);
+        // Authoritative snapshots re-send WindowAdded for every visible window
+        // (reassign_window_to_authoritative_space), including windows parked in inactive
+        // workspaces. For a window already in its workspace that is a re-confirmation, not a
+        // window landing on a hidden workspace, so it must not request a refocus (a focus raise
+        // of that display's visible window, on whichever display).
+        let reconfirmed = matches!(
+            &event,
+            LayoutEvent::WindowAdded(space, wid)
+                if self.layout_manager.layout_engine.window_in_assigned_workspace(
+                    &self.state.windows,
+                    *space,
+                    *wid,
+                )
+        );
         let event_clone = event.clone();
         let layout_outcome =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
@@ -4011,7 +4027,9 @@ impl Reactor {
             _ = input_tx.send(crate::actor::input::Request::HideOnFocus);
         }
         let geometry_changed = response.changed;
-        self.prepare_refocus_after_layout_event(&event_clone);
+        if !reconfirmed {
+            self.prepare_refocus_after_layout_event(&event_clone);
+        }
         self.handle_layout_response(response, workspace_switch_space);
         if geometry_changed {
             self.update_layout_or_warn(

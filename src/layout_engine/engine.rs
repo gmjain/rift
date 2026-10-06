@@ -1424,6 +1424,30 @@ impl LayoutEngine {
         })
     }
 
+    /// Whether `wid` already sits in its assigned workspace on `space`: in that workspace's
+    /// layout or, if floating, in the space's floating set. A `WindowAdded` for such a window
+    /// changes nothing (see `add_window_to_layout`).
+    pub(crate) fn window_in_assigned_workspace(
+        &self,
+        window_store: &WindowStore,
+        space: SpaceId,
+        wid: WindowId,
+    ) -> bool {
+        let Some(workspace_id) = window_store.workspace_for_window(space, wid) else {
+            return false;
+        };
+        let Some(workspace) = self.workspaces.workspace_info(space, workspace_id) else {
+            return false;
+        };
+        let floating_workspace = matches!(workspace.layout_system, LayoutSystemKind::Floating(_));
+        if self.floating.is_floating(wid) && !floating_workspace {
+            return self.floating.active_flat(space).contains(&wid);
+        }
+        self.workspaces
+            .active_layout(space, workspace_id)
+            .is_some_and(|layout| workspace.layout_system.contains_window(layout, wid))
+    }
+
     pub(crate) fn space_with_window(&self, wid: WindowId) -> Option<SpaceId> {
         for space in self.workspaces.layout_spaces() {
             if let Some(ws_id) = self.workspaces.active_workspace(space) {
