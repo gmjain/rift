@@ -345,3 +345,31 @@ fn unfocused_window_returning_to_hidden_workspace_does_not_refocus() {
         assert!(focus.is_empty(), "floating={parked_floating}: {focus:?}");
     }
 }
+
+/// Defence in depth: a refocus armed for a display that does not have focus must not activate
+/// that display's window (it would move the active display and the menu bar).
+#[test]
+fn refocus_on_display_without_focus_does_not_raise() {
+    let mut storm = Storm::new("BE", false);
+    let (builtin, external, chrome) = (storm.builtin, storm.external, storm.chrome);
+    for (space, expected) in [(external, vec![]), (builtin, vec![chrome])] {
+        storm.reactor.refocus_manager.refocus_state = RefocusState::Pending(space);
+        storm.reactor.handle_layout_response(layout::EventResponse::default(), None);
+        assert_eq!(focus_targets(&storm.drain_raises()), expected, "{space:?}");
+    }
+
+    // Through the reconcile path: the external display's parked window comes back to its hidden
+    // workspace while the built-in has focus.
+    let parked = storm.parked[1];
+    assert_eq!(storm.space_of(parked), external);
+    storm
+        .reactor
+        .send_layout_event(LayoutEvent::WindowRemovedPreserveFloating(parked));
+    storm.apps.simulate_until_quiet(&mut storm.reactor);
+    let snapshot = storm.snapshot(builtin, Some(builtin));
+    storm.reactor.handle_event(snapshot);
+    storm.apps.simulate_until_quiet(&mut storm.reactor);
+    let ws1 = storm.reactor.test_workspace(external, 1);
+    assert!(storm.reactor.test_workspace_windows(external, ws1).contains(&parked));
+    assert_eq!(focus_targets(&storm.drain_raises()), vec![]);
+}
