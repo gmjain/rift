@@ -47,6 +47,8 @@ mod SpaceEventHandler {
 }
 
 #[cfg(test)]
+mod raise_storm_tests;
+#[cfg(test)]
 mod tests;
 
 use std::cell::RefCell;

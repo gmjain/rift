@@ -694,7 +694,22 @@ pub fn current_cursor_location() -> Result<CGPoint, CGError> {
     Ok(point)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_NO_CURSOR_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: make `window_under_cursor` report no window instead of reading the live cursor.
+#[cfg(test)]
+pub fn set_test_no_cursor_window(no_window: bool) {
+    TEST_NO_CURSOR_WINDOW.with(|flag| flag.set(no_window));
+}
+
 pub fn window_under_cursor() -> Option<WindowServerId> {
+    #[cfg(test)]
+    if TEST_NO_CURSOR_WINDOW.with(|flag| flag.get()) {
+        return None;
+    }
     let point = current_cursor_location().ok()?;
     get_window_at_point(point)
 }
