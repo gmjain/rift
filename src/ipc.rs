@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
 use std::rc::Rc;
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
@@ -31,6 +31,22 @@ struct ConfigJob {
 }
 
 const CONFIG_QUEUE_CAPACITY: usize = 8;
+
+thread_local! {
+    /// `Some` while a reactor command of an IPC request runs; `Some(true)` once it asked to end
+    /// the process.
+    static EXIT_AFTER_REPLY: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// For a command that ends the process: inside an IPC request, defer the exit until the reply
+/// is sent and return true (rift-cli waits for the reply without a timeout).
+pub(crate) fn exit_after_reply() -> bool {
+    let in_request = EXIT_AFTER_REPLY.get().is_some();
+    if in_request {
+        EXIT_AFTER_REPLY.set(Some(true));
+    }
+    in_request
+}
 
 pub struct InstallRequest {
     config_tx: config_actor::Sender,
@@ -194,6 +210,9 @@ impl IpcRequestHandler {
             },
         };
         send_encoded_response(header, &response);
+        if EXIT_AFTER_REPLY.take() == Some(true) {
+            std::process::exit(0);
+        }
     }
 
     fn dispatch_config_request(&self, request: RiftRequest, header: &mut mach_msg_header_t) {
@@ -356,6 +375,7 @@ fn handle_reactor_command(
     reactor: &mut reactor::Reactor,
     command: crate::model::reactor::Command,
 ) -> Vec<u8> {
+    EXIT_AFTER_REPLY.set(Some(false));
     reactor.handle_ipc_command(command);
     encode_success("Command executed successfully")
 }
@@ -496,5 +516,18 @@ fn send_encoded_response(original_msg: *mut mach_msg_header_t, response_json: &[
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_waits_for_the_reply_only_inside_an_ipc_request() {
+        assert!(!exit_after_reply(), "outside IPC the caller exits at once");
+        EXIT_AFTER_REPLY.set(Some(false));
+        assert!(exit_after_reply());
+        assert_eq!(EXIT_AFTER_REPLY.take(), Some(true));
     }
 }
