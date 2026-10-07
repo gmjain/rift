@@ -52,6 +52,25 @@ pub struct VirtualWorkspaceSettings {
     pub app_rules: Vec<AppWorkspaceRule>,
     #[serde(default)]
     pub workspace_rules: Vec<WorkspaceLayoutRule>,
+    /// Whether each display has its own set of workspaces, or all displays share
+    /// one set (i3 style: a workspace lives on one display at a time).
+    #[serde(default)]
+    pub scope: WorkspaceScope,
+}
+
+/// How workspaces relate to displays.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceScope {
+    /// Every display has its own copy of every workspace: workspace 3 on the left
+    /// display and workspace 3 on the right one are different workspaces.
+    #[default]
+    PerDisplay,
+    /// One set of workspace names shared by all displays. A workspace lives on
+    /// the display showing it or holding its windows; switching to it focuses
+    /// that display, and a workspace nobody shows opens on the focused display.
+    /// Changing this setting takes effect after a restart.
+    Global,
 }
 
 /// Display a newly created window opens on.
@@ -178,11 +197,19 @@ impl Default for VirtualWorkspaceSettings {
             reapply_app_rules_on_title_change: false,
             app_rules: Vec::new(),
             workspace_rules: Vec::new(),
+            scope: WorkspaceScope::PerDisplay,
         }
     }
 }
 
 impl VirtualWorkspaceSettings {
+    /// Whether all displays share one set of workspaces.
+    pub fn is_global(&self) -> bool { self.enabled && self.scope == WorkspaceScope::Global }
+
+    /// Whether a workspace command may need to run on another display than the
+    /// one it was issued on: workspaces are bound to displays or shared by them.
+    pub fn routes_workspaces(&self) -> bool { self.is_global() || self.has_display_bindings() }
+
     /// The display `workspace_rules` bind workspace `index` to, if any. Rules
     /// match by index or by the workspace's name; the last one naming a display
     /// wins.
@@ -2068,6 +2095,25 @@ mod tests {
         let settings: VirtualWorkspaceSettings =
             toml::from_str("prevent_wrapping_around = true").unwrap();
         assert!(settings.prevent_wrapping);
+    }
+
+    #[test]
+    fn workspace_scope_defaults_to_per_display_and_parses_global() {
+        let defaults: VirtualWorkspaceSettings = toml::from_str("").unwrap();
+        assert_eq!(defaults.scope, WorkspaceScope::PerDisplay);
+        assert!(!defaults.is_global());
+        assert!(!defaults.routes_workspaces());
+
+        let settings: VirtualWorkspaceSettings = toml::from_str("scope = \"global\"").unwrap();
+        assert_eq!(settings.scope, WorkspaceScope::Global);
+        assert!(settings.is_global());
+        assert!(settings.routes_workspaces());
+
+        let disabled: VirtualWorkspaceSettings =
+            toml::from_str("enabled = false\nscope = \"global\"").unwrap();
+        assert!(!disabled.is_global());
+
+        assert!(toml::from_str::<VirtualWorkspaceSettings>("scope = \"shared\"").is_err());
     }
 
     #[test]

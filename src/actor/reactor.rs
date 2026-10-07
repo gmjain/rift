@@ -2099,7 +2099,19 @@ impl Reactor {
             Event::RaiseTimeout { sequence_id } => {
                 return Ok(system_workflow::handle_raise_timeout(sequence_id)?);
             }
-            Event::ConfigUpdated(new_cfg) => {
+            Event::ConfigUpdated(mut new_cfg) => {
+                // The workspace scope decides how every display's workspaces relate;
+                // switching it live would need the two models merged. Keep the one
+                // rift started with until a restart.
+                let running_scope = self.config.virtual_workspaces.scope;
+                if new_cfg.virtual_workspaces.scope != running_scope {
+                    warn!(
+                        ?running_scope,
+                        requested = ?new_cfg.virtual_workspaces.scope,
+                        "virtual_workspaces.scope changed; restart rift to apply it"
+                    );
+                    new_cfg.virtual_workspaces.scope = running_scope;
+                }
                 let outcome = command_workflow::handle_config_updated(
                     &mut self.config,
                     &mut self.layout_manager,
