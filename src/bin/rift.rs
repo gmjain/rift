@@ -58,7 +58,9 @@ struct Cli {
     #[arg(long)]
     validate: bool,
 
-    /// Restore the master layout file saved at shutdown.
+    /// Restore the master layout file saved at shutdown (or by autosave).
+    ///
+    /// `settings.persistence.restore_on_start = true` in the config does the same.
     #[arg(long)]
     restore: bool,
 
@@ -174,7 +176,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
 
     let (broadcast_tx, broadcast_rx) = rift_wm::actor::channel();
 
-    let mut layout = if opt.restore {
+    let mut layout = if opt.restore || config.settings.persistence.restore_on_start {
         let path = restore_file();
         match LayoutEngine::load_for_startup_restore(path.clone()) {
             Ok(layout) => layout,

@@ -578,6 +578,10 @@ pub struct Settings {
     #[serde(default)]
     pub drag_drop: DragDropSettings,
 
+    /// Saving the layout file while rift runs and restoring it at startup.
+    #[serde(default)]
+    pub persistence: PersistenceSettings,
+
     /// Commands to run on startup (e.g., for subscribing to events)
     #[serde(default)]
     pub run_on_start: Vec<String>,
@@ -587,6 +591,39 @@ pub struct Settings {
     #[serde(default = "yes")]
     pub hot_reload: bool,
 }
+
+/// The layout file (`restore_file()`) outside of explicit saves.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PersistenceSettings {
+    /// Save the layout file shortly after the layout changes, so that a restart
+    /// (or a crash) can restore it.
+    #[serde(default = "no")]
+    pub autosave: bool,
+    /// How long after the first change to wait before saving. Changes made in
+    /// the meantime are part of that one save.
+    #[serde(default = "default_autosave_debounce_ms")]
+    pub autosave_debounce_ms: u64,
+    /// Restore the layout file at startup, as `rift --restore` does.
+    #[serde(default = "no")]
+    pub restore_on_start: bool,
+}
+
+impl Default for PersistenceSettings {
+    fn default() -> Self {
+        Self {
+            autosave: false,
+            autosave_debounce_ms: default_autosave_debounce_ms(),
+            restore_on_start: false,
+        }
+    }
+}
+
+impl PersistenceSettings {
+    pub const MIN_AUTOSAVE_DEBOUNCE_MS: u64 = 100;
+}
+
+fn default_autosave_debounce_ms() -> u64 { 1000 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -1383,6 +1420,14 @@ impl Settings {
             ));
         }
 
+        if self.persistence.autosave_debounce_ms < PersistenceSettings::MIN_AUTOSAVE_DEBOUNCE_MS {
+            issues.push(format!(
+                "persistence.autosave_debounce_ms must be at least {}, got {}",
+                PersistenceSettings::MIN_AUTOSAVE_DEBOUNCE_MS,
+                self.persistence.autosave_debounce_ms
+            ));
+        }
+
         issues
     }
 }
@@ -2108,6 +2153,43 @@ mod tests {
         );
         assert!(settings.traditional.equalize_nodes);
         assert_eq!(settings.scrolling.animate, Some(false));
+    }
+
+    #[test]
+    fn persistence_settings_default_off_and_parse() {
+        let defaults: Settings = toml::from_str("").unwrap();
+        assert_eq!(defaults.persistence, PersistenceSettings {
+            autosave: false,
+            autosave_debounce_ms: 1000,
+            restore_on_start: false,
+        });
+        assert_eq!(Config::default().settings.persistence, defaults.persistence);
+
+        let settings: Settings = toml::from_str(
+            r#"
+                [persistence]
+                autosave = true
+                autosave_debounce_ms = 250
+                restore_on_start = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(settings.persistence, PersistenceSettings {
+            autosave: true,
+            autosave_debounce_ms: 250,
+            restore_on_start: true,
+        });
+        assert!(settings.validate().is_empty());
+
+        assert!(toml::from_str::<Settings>("[persistence]\nautosave_every = 1").is_err());
+        let too_short: Settings =
+            toml::from_str("[persistence]\nautosave_debounce_ms = 10").unwrap();
+        assert!(
+            too_short
+                .validate()
+                .iter()
+                .any(|issue| issue.contains("persistence.autosave_debounce_ms"))
+        );
     }
 
     #[test]
