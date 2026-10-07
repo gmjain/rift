@@ -641,7 +641,102 @@ pub struct UiSettings {
     pub stack_line: StackLineSettings,
     #[serde(default)]
     pub mission_control: MissionControlSettings,
+    #[serde(default)]
+    pub border: BorderSettings,
 }
+
+/// Window borders drawn by rift in the gaps around managed windows: one
+/// click-through overlay per display, ordered below every app window.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BorderSettings {
+    #[serde(default = "no")]
+    pub enabled: bool,
+    /// Stroke width in points, drawn outside the window frame.
+    #[serde(default = "default_border_width")]
+    pub width: f64,
+    /// Corner radius of the stroke's inner edge; match the window corner radius.
+    #[serde(default = "default_border_radius")]
+    pub radius: f64,
+    #[serde(default = "default_border_active_color")]
+    pub active_color: Color,
+    #[serde(default = "default_border_inactive_color")]
+    pub inactive_color: Color,
+    /// Color of unfocused floating windows; `inactive_color` when unset.
+    #[serde(default)]
+    pub floating_color: Option<Color>,
+    /// Stroke of windows in rift fullscreen (`toggle_fullscreen` and
+    /// `toggle_fullscreen_within_gaps`); the normal stroke when unset.
+    #[serde(default)]
+    pub fullscreen: Option<BorderFullscreenSettings>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BorderFullscreenSettings {
+    /// Falls back to the focus-dependent color when unset.
+    #[serde(default)]
+    pub color: Option<Color>,
+    /// Falls back to `width` when unset.
+    #[serde(default)]
+    pub width: Option<f64>,
+}
+
+impl Default for BorderSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            width: default_border_width(),
+            radius: default_border_radius(),
+            active_color: default_border_active_color(),
+            inactive_color: default_border_inactive_color(),
+            floating_color: None,
+            fullscreen: None,
+        }
+    }
+}
+
+impl BorderSettings {
+    pub fn floating_color(&self) -> Color { self.floating_color.unwrap_or(self.inactive_color) }
+
+    pub fn fullscreen_width(&self) -> f64 {
+        self.fullscreen.and_then(|fullscreen| fullscreen.width).unwrap_or(self.width)
+    }
+
+    /// The fullscreen stroke color, or `None` to keep the focus-dependent one.
+    pub fn fullscreen_color(&self) -> Option<Color> {
+        self.fullscreen.and_then(|fullscreen| fullscreen.color)
+    }
+
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if !(self.width >= 0.0) {
+            issues.push(format!(
+                "ui.border.width must be non-negative, got {}",
+                self.width
+            ));
+        }
+        if !(self.radius >= 0.0) {
+            issues.push(format!(
+                "ui.border.radius must be non-negative, got {}",
+                self.radius
+            ));
+        }
+        if let Some(width) = self.fullscreen.and_then(|fullscreen| fullscreen.width)
+            && !(width >= 0.0)
+        {
+            issues.push(format!(
+                "ui.border.fullscreen.width must be non-negative, got {width}"
+            ));
+        }
+        issues
+    }
+}
+
+fn default_border_width() -> f64 { 4.0 }
+fn default_border_radius() -> f64 { 12.0 }
+fn default_border_active_color() -> Color { Color::new(0.0, 0.5, 1.0, 1.0) }
+fn default_border_inactive_color() -> Color { Color::new(0.5, 0.5, 0.5, 0.8) }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1427,6 +1522,8 @@ impl Settings {
                 self.persistence.autosave_debounce_ms
             ));
         }
+
+        issues.extend(self.ui.border.validate());
 
         issues
     }
@@ -2682,6 +2779,77 @@ mod tests {
         json["binding_mode_specs"] = serde_json::json!([["default", []], ["default", []]]);
         let config: Config = serde_json::from_value(json).unwrap();
         assert!(config.validate().iter().any(|issue| issue.contains("unique")));
+    }
+
+    #[test]
+    fn border_settings_default_off_with_fallbacks() {
+        let defaults: BorderSettings = toml::from_str("").unwrap();
+        assert_eq!(defaults, BorderSettings::default());
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.width, 4.0);
+        assert_eq!(defaults.radius, 12.0);
+        assert_eq!(defaults.floating_color(), defaults.inactive_color);
+        assert_eq!(defaults.fullscreen_width(), defaults.width);
+        assert_eq!(defaults.fullscreen_color(), None);
+        assert!(defaults.validate().is_empty());
+
+        // The shipped default config and a config without the section agree.
+        assert_eq!(Config::default().settings.ui.border, BorderSettings::default());
+        let cfg = Config::parse("[settings]\n[keys]\n[virtual_workspaces]\n").unwrap();
+        assert_eq!(cfg.settings.ui.border, BorderSettings::default());
+    }
+
+    #[test]
+    fn border_settings_parse_colors_and_optional_fullscreen_table() {
+        let settings: BorderSettings = toml::from_str(
+            r#"
+            enabled = true
+            width = 7.0
+            radius = 9.5
+            active_color = { r = 1.0, g = 0.0, b = 0.0 }
+            inactive_color = { r = 0.35, g = 0.35, b = 0.45, a = 0.9 }
+            floating_color = { r = 0.2, g = 0.8, b = 0.2, a = 1.0 }
+            fullscreen = { color = { r = 1.0, g = 0.8, b = 0.0 }, width = 2.0 }
+            "#,
+        )
+        .unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.width, 7.0);
+        assert_eq!(settings.radius, 9.5);
+        assert_eq!(settings.active_color, Color::new(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(settings.inactive_color, Color::new(0.35, 0.35, 0.45, 0.9));
+        assert_eq!(settings.floating_color(), Color::new(0.2, 0.8, 0.2, 1.0));
+        assert_eq!(settings.fullscreen_color(), Some(Color::new(1.0, 0.8, 0.0, 1.0)));
+        assert_eq!(settings.fullscreen_width(), 2.0);
+        assert!(settings.validate().is_empty());
+
+        // A partial fullscreen table keeps the normal values for what it leaves out.
+        let partial: BorderSettings =
+            toml::from_str("fullscreen = { width = 1.0 }\nwidth = 3.0").unwrap();
+        assert_eq!(partial.fullscreen_width(), 1.0);
+        assert_eq!(partial.fullscreen_color(), None);
+        let partial: BorderSettings =
+            toml::from_str("fullscreen = { color = { r = 1.0 } }").unwrap();
+        assert_eq!(partial.fullscreen_width(), partial.width);
+        assert_eq!(partial.fullscreen_color(), Some(Color::new(1.0, 0.0, 0.0, 1.0)));
+
+        assert!(toml::from_str::<BorderSettings>("fullscreen = { colour = { r = 1.0 } }").is_err());
+        assert!(toml::from_str::<BorderSettings>("thickness = 4.0").is_err());
+    }
+
+    #[test]
+    fn border_settings_validate_rejects_negative_sizes() {
+        let settings: BorderSettings =
+            toml::from_str("width = -1.0\nradius = -2.0\nfullscreen = { width = -3.0 }").unwrap();
+        let issues = settings.validate();
+        assert_eq!(issues.len(), 3, "{issues:?}");
+        assert!(issues.iter().any(|issue| issue.contains("ui.border.width")));
+        assert!(issues.iter().any(|issue| issue.contains("ui.border.radius")));
+        assert!(issues.iter().any(|issue| issue.contains("ui.border.fullscreen.width")));
+
+        let mut config = Config::default();
+        config.settings.ui.border.width = -1.0;
+        assert!(config.validate().iter().any(|issue| issue.contains("ui.border.width")));
     }
 
     #[test]
