@@ -798,6 +798,15 @@ mod test {
         assert_eq!(super::menu_bar_inset(false, 24.0, 0.0), 25.0);
     }
 
+    /// `ScreenCache::refresh` and `constrain_display_bounds` query live SkyLight display state.
+    /// SkyLight sets up its window-management bridge (`SLSWMBridgeDelegate`) lazily and without
+    /// locking, so concurrent first calls abort the test process: run these one at a time.
+    static LIVE_SKYLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn live_skylight() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_SKYLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct Stub {
         cg_screens: Vec<CGScreenInfo>,
         ns_screens: Vec<NSScreenInfo>,
@@ -855,6 +864,7 @@ mod test {
 
     #[test]
     fn it_calculates_the_visible_frame() {
+        let _skylight = live_skylight();
         let stub = Stub {
             cg_screens: vec![
                 CGScreenInfo {
@@ -916,6 +926,7 @@ mod test {
 
     #[test]
     fn clears_cached_screen_identifiers_when_display_list_is_empty() {
+        let _skylight = live_skylight();
         let bounds = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1440.0, 900.0));
         let visible_frame = CGRect::new(CGPoint::new(0.0, 22.0), CGSize::new(1440.0, 878.0));
 
