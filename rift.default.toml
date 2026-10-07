@@ -308,6 +308,18 @@ workspace_auto_back_and_forth = false
 prevent_wrapping = false
 reapply_app_rules_on_title_change = false
 
+# How workspaces relate to displays:
+# - "per_display" (default): every display has its own set of workspaces; workspace 3
+#   on the left display and workspace 3 on the right one are different workspaces
+# - "global": one set of workspaces shared by all displays, as in i3 and AeroSpace: a
+#   workspace lives on the display showing it or holding its windows, switching to
+#   it focuses that display, and a workspace no display owns opens on the display you
+#   are on. Cycling runs over a display's own and the unowned workspaces, back-and-forth
+#   has one target for all displays, move_workspace_to_display keeps the layout, and a
+#   display that disconnects hands its workspaces to the remaining one until it is back.
+# Changing the scope takes effect after a restart (a reload keeps the running scope).
+scope = "per_display"
+
 # Workspace-specific rules
 # - workspace: target workspace by index (integer) or name (string); unnamed
 #   workspaces are named "Workspace N"
