@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::collections::{HashMap, HashSet};
 use crate::actor::wm_controller::WmCommand;
+pub use crate::model::workspace_hud::WorkspaceHudSettings;
 use crate::sys::hotkey::{Hotkey, HotkeySpec};
 
 pub const MAX_WORKSPACES: usize = 128;
@@ -657,6 +658,8 @@ pub struct UiSettings {
     pub border: BorderSettings,
     #[serde(default)]
     pub dim: DimSettings,
+    #[serde(default)]
+    pub workspace_hud: WorkspaceHudSettings,
 }
 
 /// Dim every window but the focused one: one translucent click-through
@@ -1605,6 +1608,7 @@ impl Settings {
 
         issues.extend(self.ui.border.validate());
         issues.extend(self.ui.dim.validate());
+        issues.extend(self.ui.workspace_hud.validate());
 
         issues
     }

@@ -324,6 +324,61 @@ fade_ms = 150
 # focus last sat on there; "dim" dims everything there
 other_displays = "keep_last_focused"
 
+[settings.ui.workspace_hud]
+# a card naming the workspace, drawn by rift the moment a workspace switch is decided
+# (hotkey/IPC switch, next/prev, back-and-forth, a switch routed to another display, move
+# window with follow, an overview pick, an app activation that switches workspace). One per
+# action; a switch during the shown time or the fade updates the card in place. Off by default.
+# Every key applies on hot reload.
+enabled = false
+# starting look; every key below overrides it:
+#   "card"    520x120, corner_radius 18, black a=0.65, white 44 pt semibold, centered
+#   "pill"    width from the text, height ~1.8x font_size, fully rounded
+#   "minimal" no background, the text with a soft shadow
+#   "toast"   22 pt medium, corner_radius 12, anchor "bottom" with offset { y = -48 }
+style = "card"
+# {name} = workspace name, {index} = 1-based position, {display} = display name
+text = "Workspace {name}"
+# fully shown time, then a fade (in and out) of fade_ms, in milliseconds
+duration_ms = 550
+fade_ms = 120
+# a subtle 0.95 -> 1.0 pop when it appears (compositor-side)
+scale_in = false
+# where: "target" (the display that shows the workspace), "focused" (the display that had focus
+# when the switch was asked for), "cursor" (under the mouse; one cursor read per show), "all"
+display = "target"
+# Style keys (unset = the preset's value):
+# one of "top-left" "top" "top-right" "left" "center" "right" "bottom-left" "bottom"
+# "bottom-right", on the display's visible frame (below the menu bar, clear of the Dock)
+# anchor = "center"
+# points from the anchor, positive x = right, positive y = down; the card always stays fully
+# on the visible frame
+# offset = { x = 0, y = 0 }
+# points, or "auto" (from the text plus padding; an auto-width overlay spans the display width,
+# transparent and click-through, so a show only moves layers)
+# width = 520
+# height = 120
+# clamped to half the card's shorter side (a large value gives a pill)
+# corner_radius = 18
+# space between the text and the card's edges, in points
+# padding = { x = 20, y = 0 }
+# background_color = { r = 0.0, g = 0.0, b = 0.0, a = 0.65 }
+# real behind-window blur, 0 = off. Opt-in: while the card is up the compositor re-blurs what is
+# behind it every frame (GPU, not rift's CPU); the cost is nil while hidden
+# blur_radius = 0
+# stroke along the rounded edge; 0 = none
+# border_color = { r = 1.0, g = 1.0, b = 1.0, a = 0.2 }
+# border_width = 0
+# true | false | { radius, opacity }: under the card, or under the text when there is no background
+# (that text shadow is rendered by the compositor from the glyphs; the card's uses a fixed path)
+# shadow = true
+# font_size = 44
+# "regular" | "medium" | "semibold" | "bold"
+# font_weight = "semibold"
+# a family name ("Menlo", "Helvetica Neue") or a font name; the system font when not installed
+# font_family = "Helvetica Neue"
+# text_color = { r = 1.0, g = 1.0, b = 1.0, a = 1.0 }
+
 # Trackpad gestures
 [settings.gestures]
 # Enable horizontal swipes to switch virtual workspaces
