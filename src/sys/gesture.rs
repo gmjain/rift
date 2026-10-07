@@ -185,6 +185,11 @@ pub struct Filter {
     app: NativeSequence,
     scroll: NativeSequence,
 }
+
+// SAFETY: the held CGEvents are CF objects (thread-safe retain/release) that
+// only the holder of the input state lock touches; the filter lives inside
+// that lock and moves between the input actor and the event-tap thread.
+unsafe impl Send for Filter {}
 impl Filter {
     /// No copies/allocations on the normal forward/drop path. Sequence state
     /// stays on the tap thread; only Ownership is read from the worker.

@@ -690,6 +690,8 @@ pub fn get_window_at_point(mut point: CGPoint) -> Option<WindowServerId> {
 pub fn is_point_occluded_by_external_window(mut point: CGPoint) -> bool {
     use objc2_app_kit::NSNormalWindowLevel;
 
+    #[cfg(test)]
+    TEST_WINDOW_AT_POINT_QUERY_COUNT.with(|count| count.set(count.get() + 1));
     let mut hit = find_window_at_point(&mut point, None);
 
     // Skip past any Rift-owned windows stacked at this point.
@@ -1036,6 +1038,17 @@ pub fn window_space_query_count() -> usize {
 #[cfg(test)]
 pub fn window_order_query_count() -> usize {
     TEST_WINDOW_ORDER_QUERY_COUNT.with(|count| count.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_WINDOW_AT_POINT_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Occlusion queries made on this thread (`is_point_occluded_by_external_window`).
+#[cfg(test)]
+pub fn window_at_point_query_count() -> usize {
+    TEST_WINDOW_AT_POINT_QUERY_COUNT.with(|count| count.get())
 }
 
 #[cfg(test)]

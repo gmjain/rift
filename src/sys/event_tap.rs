@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,78 @@ use objc2_core_graphics::{
     CGEvent, CGEventMask, CGEventTapLocation as CGTapLoc, CGEventTapOptions as CGTapOpt,
     CGEventTapPlacement as CGTapPlace, CGEventTapProxy, CGEventType,
 };
+use parking_lot::Mutex;
 use tracing::warn;
+
+use super::run_loop::WakeupHandle;
+
+/// A thread whose run loop services event taps and nothing else.
+///
+/// WindowServer waits for an active tap's callback before delivering each
+/// masked key and click, so the thread that runs the callback must never be
+/// busy with a synchronous WindowServer call. Taps are created and torn down
+/// from other threads; their callback contexts are freed here, serialized with
+/// the callbacks, so a callback in flight never sees a freed context.
+pub struct TapThread {
+    run_loop: CFRetained<CFRunLoop>,
+    retired: Arc<Mutex<Vec<Retired>>>,
+    wake: WakeupHandle,
+}
+
+struct Retired(*mut c_void, unsafe fn(*mut c_void));
+
+// SAFETY: a retired context is only ever dropped on the tap thread, through the
+// dropper it was created with. CFRunLoop is thread-safe; this handle only adds
+// and removes sources and wakes the loop.
+unsafe impl Send for Retired {}
+unsafe impl Send for TapThread {}
+unsafe impl Sync for TapThread {}
+
+struct Handoff(CFRetained<CFRunLoop>, WakeupHandle);
+unsafe impl Send for Handoff {}
+
+impl TapThread {
+    pub fn spawn() -> Option<Arc<Self>> {
+        let retired: Arc<Mutex<Vec<Retired>>> = Arc::default();
+        let graveyard = retired.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("event-tap".into())
+            .spawn(move || {
+                set_user_interactive_qos();
+                // Also keeps the loop alive while no tap is installed.
+                let wake = WakeupHandle::for_current_thread(0, move || {
+                    for Retired(ptr, dropper) in std::mem::take(&mut *graveyard.lock()) {
+                        unsafe { dropper(ptr) };
+                    }
+                });
+                let run_loop = CFRunLoop::current().expect("event tap thread has a run loop");
+                let _ = tx.send(Handoff(run_loop, wake));
+                loop {
+                    CFRunLoop::run();
+                }
+            })
+            .ok()?;
+        let Handoff(run_loop, wake) = rx.recv().ok()?;
+        Some(Arc::new(Self { run_loop, retired, wake }))
+    }
+
+    /// Frees `ptr` with `dropper` on the tap thread, after any callback in flight.
+    pub(crate) fn retire(&self, ptr: *mut c_void, dropper: unsafe fn(*mut c_void)) {
+        self.retired.lock().push(Retired(ptr, dropper));
+        self.wake.wake();
+    }
+}
+
+fn set_user_interactive_qos() {
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    if unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) } != 0 {
+        warn!("Could not raise the event tap thread to user-interactive QoS");
+    }
+}
 
 pub type TapCallback = Option<
     unsafe extern "C-unwind" fn(
@@ -128,7 +200,9 @@ struct TrampolineCtx {
     original_drop: Option<unsafe fn(*mut c_void)>,
     reenabled_callback: TapReenabledCallback,
     invalidated_callback: TapInvalidatedCallback,
-    port_ptr: Option<core::ptr::NonNull<CFMachPort>>,
+    /// Own retain: the owner may release its `EventTap` on another thread while
+    /// a callback here still re-enables the port.
+    port: Option<CFRetained<CFMachPort>>,
     breaker: RefCell<Breaker>,
     passthrough: Cell<bool>,
 }
@@ -163,8 +237,8 @@ extern "C-unwind" fn trampoline_callback(
         let reason = if ety == -2 { "timeout" } else { "user input" };
         // The only WindowServer call allowed here. Whether it took effect is
         // checked by the owner on its own thread (see TapReenabledCallback).
-        if let Some(port_ptr) = ctx.port_ptr {
-            CGEvent::tap_enable(unsafe { port_ptr.as_ref() }, true);
+        if let Some(port) = &ctx.port {
+            CGEvent::tap_enable(port, true);
         }
         let mut breaker = ctx.breaker.borrow_mut();
         match breaker.record_disabled(Instant::now()) {
@@ -227,12 +301,15 @@ unsafe fn trampoline_drop(ptr: *mut c_void) {
 pub struct EventTap {
     port: CFRetained<CFMachPort>,
     source: CFRetained<CFRunLoopSource>,
+    run_loop: Option<CFRetained<CFRunLoop>>,
+    thread: Option<Arc<TapThread>>,
     user_info: *mut c_void,
     drop_ctx: Option<unsafe fn(*mut c_void)>,
 }
 
 impl EventTap {
-    /// Creates a tap on the current run loop (Rift input uses active HID).
+    /// Creates a tap serviced by `thread`, or by the current run loop when
+    /// `thread` is `None` (Rift input uses active HID).
     /// On failure the caller retains ownership of `user_info`.
     pub unsafe fn new(
         location: CGTapLoc,
@@ -243,6 +320,7 @@ impl EventTap {
         drop_ctx: Option<unsafe fn(*mut c_void)>,
         reenabled_callback: TapReenabledCallback,
         invalidated_callback: TapInvalidatedCallback,
+        thread: Option<&Arc<TapThread>>,
     ) -> Option<Self> {
         let tramp = Box::new(TrampolineCtx {
             callback,
@@ -250,7 +328,7 @@ impl EventTap {
             original_drop: drop_ctx,
             reenabled_callback,
             invalidated_callback,
-            port_ptr: None,
+            port: None,
             breaker: RefCell::new(Breaker::new(
                 TIMEOUT_LIMIT.load(Ordering::Relaxed),
                 TIMEOUT_WINDOW,
@@ -284,7 +362,18 @@ impl EventTap {
             }
             return None;
         };
-        if let Some(rl) = CFRunLoop::current() {
+        let run_loop = match thread {
+            Some(thread) => Some(thread.run_loop.clone()),
+            None => CFRunLoop::current(),
+        };
+        unsafe {
+            // Set before the source is scheduled: the first callback may be a
+            // disable notice that has to re-enable the port.
+            let tramp_ctx = &mut *(tramp_ptr as *mut TrampolineCtx);
+            tramp_ctx.port = Some(port.clone());
+            port.set_invalidation_call_back(Some(port_invalidated));
+        }
+        if let Some(rl) = &run_loop {
             let mode: &CFRunLoopMode = unsafe {
                 kCFRunLoopCommonModes.expect("kCFRunLoopCommonModes should be available on macOS")
             };
@@ -292,20 +381,14 @@ impl EventTap {
         }
         CGEvent::tap_enable(&port, true);
 
-        let event_tap = Self {
+        Some(Self {
             port,
             source,
+            run_loop,
+            thread: thread.cloned(),
             user_info: tramp_ptr,
             drop_ctx: Some(trampoline_drop),
-        };
-
-        unsafe {
-            let tramp_ctx = &mut *(tramp_ptr as *mut TrampolineCtx);
-            tramp_ctx.port_ptr = Some(core::ptr::NonNull::from(&*event_tap.port));
-            event_tap.port.set_invalidation_call_back(Some(port_invalidated));
-        }
-
-        Some(event_tap)
+        })
     }
 
     /// Synchronous WindowServer query; never call it from the tap callback.
@@ -320,12 +403,16 @@ impl Drop for EventTap {
             unsafe { self.port.set_invalidation_call_back(None) };
             CGEvent::tap_enable(&self.port, false);
         }
-        if let Some(rl) = CFRunLoop::current() {
+        if let Some(rl) = &self.run_loop {
             rl.remove_source(Some(&self.source), unsafe { kCFRunLoopCommonModes });
         }
         self.port.invalidate();
         if let Some(dropper) = self.drop_ctx {
-            unsafe { dropper(self.user_info) };
+            match &self.thread {
+                // A callback may still be running there; let that thread free the context.
+                Some(thread) => thread.retire(self.user_info, dropper),
+                None => unsafe { dropper(self.user_info) },
+            }
         }
     }
 }
@@ -369,7 +456,7 @@ mod tests {
             original_drop: None,
             reenabled_callback: Some(count_reconcile),
             invalidated_callback: None,
-            port_ptr: None,
+            port: None,
             breaker: RefCell::new(Breaker::new(
                 1,
                 Duration::from_secs(60),
