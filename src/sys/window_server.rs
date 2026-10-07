@@ -36,6 +36,10 @@ use crate::sys::skylight::*;
 
 static G_CONNECTION: Lazy<i32> = Lazy::new(|| unsafe { SLSMainConnectionID() });
 static LAST_WINDOWSERVER_ACTIVITY_US: AtomicU64 = AtomicU64::new(0);
+// Tests run against a fake window server built from these overrides. Queries a test did not
+// set up must answer "nothing" instead of falling through to the live WindowServer: fixture
+// window and space ids are real ids on a desktop Mac, and SkyLight's lazy window-management
+// bridge (`SLSWMBridgeDelegate`) is not thread-safe, so parallel test threads abort in it.
 #[cfg(test)]
 thread_local! {
     static TEST_FAILED_SPACE_QUERIES: RefCell<HashSet<u64>> = RefCell::new(HashSet::default());
@@ -425,6 +429,9 @@ pub fn window_parent(id: WindowServerId) -> Option<WindowServerId> {
 }
 
 pub fn window_is_sticky(id: WindowServerId) -> bool {
+    if cfg!(test) {
+        return window_spaces(id).len() > 1;
+    }
     let cf_windows = cf_array_from_ids(&[id]);
     let space_list_ref = unsafe {
         SLSCopySpacesForWindows(*G_CONNECTION, 0x7, CFRetained::as_ptr(&cf_windows).as_ptr())
@@ -442,6 +449,9 @@ pub fn window_spaces(id: WindowServerId) -> Vec<crate::sys::screen::SpaceId> {
         TEST_WINDOW_SPACES_OVERRIDE.with(|spaces| spaces.borrow().get(&id.as_u32()).cloned())
     {
         return override_spaces.into_iter().map(crate::sys::screen::SpaceId::new).collect();
+    }
+    if cfg!(test) {
+        return Vec::new();
     }
 
     let cf_windows = cf_array_from_ids(&[id]);
@@ -787,6 +797,9 @@ pub fn try_space_window_list_for_connection(
         let _ = (spaces, owner, include_minimized);
         return Some(override_ids);
     }
+    if cfg!(test) {
+        return Some(Vec::new());
+    }
 
     let cf_space_array = cf_array_from_u64s(spaces);
 
@@ -942,7 +955,10 @@ pub fn app_window_suitable(id: WindowServerId) -> bool {
     app_window_suitability(id).unwrap_or(false)
 }
 
-pub fn space_is_user(sid: u64) -> bool { unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 0 } }
+pub fn space_is_user(sid: u64) -> bool {
+    // Test fixture spaces are user spaces, as in `SpacesActor::is_user_space`.
+    cfg!(test) || unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 0 }
+}
 pub fn space_is_fullscreen(sid: u64) -> bool { unsafe { SLSSpaceGetType(*G_CONNECTION, sid) == 4 } }
 
 // credit: https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
