@@ -9785,3 +9785,40 @@ fn global_workspaces_queries_report_the_display_owning_each_workspace() {
         }
     }
 }
+
+#[test]
+fn global_workspaces_menu_bar_lists_each_display_its_own_and_the_unowned_workspaces() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    // ws2 holds a window parked on the right display.
+    focus_display_space(&mut reactor, right_space);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(2));
+    let _parked = open_window_on_right(&mut apps, &mut reactor, 2);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    apps.simulate_until_quiet(&mut reactor);
+    let (tx, mut rx) = crate::actor::channel();
+    reactor.menu_manager.menu_tx = Some(tx);
+
+    reactor.maybe_send_menu_update();
+
+    let (_, menu_bar::Event::Update(update)) = rx.try_recv().unwrap() else {
+        panic!("expected menu update")
+    };
+    let listed = |space: SpaceId| -> Vec<(usize, bool)> {
+        update
+            .displays
+            .iter()
+            .find(|display| display.space == space)
+            .expect("display listed")
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.index, workspace.is_active))
+            .collect()
+    };
+    assert_eq!(
+        listed(left_space),
+        vec![(0, true), (3, false)],
+        "the left display: its ws0 and the unowned ws3, by their shared index"
+    );
+    assert_eq!(listed(right_space), vec![(1, true), (2, false), (3, false)]);
+}

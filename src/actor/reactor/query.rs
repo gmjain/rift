@@ -269,13 +269,24 @@ impl Reactor {
                 .then_with(|| a.0.origin.y.total_cmp(&b.0.origin.y))
                 .then_with(|| a.1.cmp(&b.1))
         });
+        let global = self.has_global_workspaces();
         let displays = screens
             .into_iter()
-            .map(|(_, display_uuid, space)| menu_bar::DisplayWorkspaces {
-                display_uuid,
-                space,
-                is_active_context: Some(space) == active_space,
-                workspaces: self.query_workspaces(Some(space)),
+            .map(|(_, display_uuid, space)| {
+                let mut workspaces = self.query_workspaces(Some(space));
+                if global {
+                    // One shared set: a display lists the workspaces it owns and
+                    // those nobody does (shown when `show_empty` is on).
+                    workspaces.retain(|workspace| {
+                        workspace.display_uuid.as_ref().is_none_or(|owner| *owner == display_uuid)
+                    });
+                }
+                menu_bar::DisplayWorkspaces {
+                    display_uuid,
+                    space,
+                    is_active_context: Some(space) == active_space,
+                    workspaces,
+                }
             })
             .collect();
 
