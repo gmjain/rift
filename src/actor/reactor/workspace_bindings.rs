@@ -25,8 +25,8 @@
 //! binding above forces the owner). A workspace no display owns does not exist
 //! yet, as in i3, and opens on the display the user is on. The routing above
 //! then applies to every workspace, which gives one shared set of workspaces
-//! over the per-display copies; cycling on a display runs over its own and the
-//! unowned workspaces.
+//! over the per-display copies: cycling on a display runs over its own and the
+//! unowned workspaces, and back-and-forth has one target for all displays.
 
 use tracing::warn;
 
@@ -251,12 +251,38 @@ impl Reactor {
         fullest.map(|(_, space)| space)
     }
 
-    /// Bring the derived workspace owners up to date after an event changed
-    /// workspaces or windows.
-    pub(crate) fn settle_global_workspaces(&mut self) {
-        if self.has_global_workspaces() {
-            self.refresh_workspace_owners();
+    /// With global workspaces, remember which workspace has focus so that
+    /// back-and-forth can return to the one focused before it, on any display.
+    pub(crate) fn note_global_workspace_focus(&mut self) {
+        if !self.has_global_workspaces() {
+            return;
         }
+        let Some(space) = self.command_context_space() else {
+            return;
+        };
+        let workspaces = self.layout_manager.layout_engine.workspaces_mut();
+        if let Some(index) = workspaces.active_workspace_idx(space) {
+            workspaces.note_focused_workspace(index as usize);
+        }
+    }
+
+    /// Bring the derived workspace owners and the focused workspace up to date
+    /// after an event changed workspaces or windows.
+    pub(crate) fn settle_global_workspaces(&mut self) {
+        if !self.has_global_workspaces() {
+            return;
+        }
+        self.refresh_workspace_owners();
+        self.note_global_workspace_focus();
+    }
+
+    /// The workspace, by position, that `space` currently shows.
+    fn active_workspace_index(&self, space: SpaceId) -> Option<usize> {
+        self.layout_manager
+            .layout_engine
+            .workspaces()
+            .active_workspace_idx(space)
+            .map(|index| index as usize)
     }
 
     fn workspace_ordinal(&self, space: SpaceId, workspace: VirtualWorkspaceId) -> Option<usize> {
@@ -276,9 +302,36 @@ impl Reactor {
         self.settle_global_workspaces();
         match command {
             LayoutCommand::SwitchToWorkspace(index) => {
+                let here = self.command_context_space();
+                if self.has_global_workspaces()
+                    && here.is_some_and(|space| self.active_workspace_index(space) == Some(*index))
+                {
+                    // Already showing here. The workspace store's own
+                    // back-and-forth is per display; use the shared target.
+                    let last = self
+                        .config
+                        .virtual_workspaces
+                        .workspace_auto_back_and_forth
+                        .then(|| self.global_back_and_forth_target())
+                        .flatten()
+                        .filter(|last| last != index);
+                    return Some(match last {
+                        Some(last) => self.switch_to_workspace_anywhere(last),
+                        None => Ok(EventOutcome::no_change()),
+                    });
+                }
                 let owner = self.owner_space_for_workspace_index(*index)?;
-                (self.command_context_space() != Some(owner))
-                    .then(|| self.switch_to_bound_workspace(owner, *index))
+                (here != Some(owner)).then(|| self.switch_to_bound_workspace(owner, *index))
+            }
+            LayoutCommand::SwitchToLastWorkspace if self.has_global_workspaces() => {
+                let here = self.command_context_space();
+                let last = self.global_back_and_forth_target().filter(|last| {
+                    here.and_then(|space| self.active_workspace_index(space)) != Some(*last)
+                });
+                Some(match last {
+                    Some(last) => self.switch_to_workspace_anywhere(last),
+                    None => Ok(EventOutcome::no_change()),
+                })
             }
             LayoutCommand::MoveWindowToWorkspace { workspace, follow, window_id } => {
                 let window = self.resolve_command_window(*window_id)?;
@@ -297,6 +350,28 @@ impl Reactor {
                 Some(self.move_window_to_bound_workspace(window, source, owner, index, *follow))
             }
             _ => None,
+        }
+    }
+
+    /// The shared back-and-forth target, if it is a workspace that exists.
+    fn global_back_and_forth_target(&self) -> Option<usize> {
+        let count = self.config.virtual_workspaces.default_workspace_count.max(1);
+        self.layout_manager
+            .layout_engine
+            .workspaces()
+            .global_last_workspace()
+            .filter(|index| *index < count)
+    }
+
+    /// Show workspace `index` on its owner, or on the display the user is on.
+    fn switch_to_workspace_anywhere(&mut self, index: usize) -> anyhow::Result<EventOutcome> {
+        let here = self.command_context_space();
+        match self.owner_space_for_workspace_index(index).or(here) {
+            Some(owner) if here != Some(owner) => self.switch_to_bound_workspace(owner, index),
+            Some(space) => {
+                self.dispatch_layout_command_on(LayoutCommand::SwitchToWorkspace(index), space)
+            }
+            None => Ok(EventOutcome::no_change()),
         }
     }
 

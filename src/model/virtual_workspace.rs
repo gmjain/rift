@@ -187,6 +187,15 @@ pub struct WorkspaceStore {
     /// their workspace number on the display they land on.
     #[serde(skip)]
     vanished_spaces: HashSet<SpaceId>,
+    /// With global workspaces: the workspace (by position) focused before the
+    /// current one, on whichever display, for back-and-forth. Absent in layout
+    /// files written before the setting existed.
+    #[serde(default)]
+    global_last_workspace: Option<usize>,
+    /// The workspace position last seen focused, to tell a focus change from a
+    /// repeat. Rebuilt from the live state after a restore.
+    #[serde(skip)]
+    global_focused_workspace: Option<usize>,
     #[serde(skip)]
     pub workspace_auto_back_and_forth: bool,
     #[serde(skip)]
@@ -336,6 +345,8 @@ impl WorkspaceStore {
             preferred_default_workspace: HashMap::default(),
             foreign_workspaces: HashMap::default(),
             vanished_spaces: HashSet::default(),
+            global_last_workspace: None,
+            global_focused_workspace: None,
             workspace_auto_back_and_forth: config.workspace_auto_back_and_forth,
             prevent_wrapping: config.prevent_wrapping,
             workspace_rules: config.workspace_rules.clone(),
@@ -477,6 +488,20 @@ impl WorkspaceStore {
     pub(crate) fn is_vanished_space(&self, space: SpaceId) -> bool {
         self.vanished_spaces.contains(&space)
     }
+
+    /// Record that workspace `index` is the focused one, on whichever display.
+    /// A change makes the previously focused workspace the back-and-forth target.
+    pub(crate) fn note_focused_workspace(&mut self, index: usize) {
+        if self.global_focused_workspace == Some(index) {
+            return;
+        }
+        if let Some(previous) = self.global_focused_workspace.replace(index) {
+            self.global_last_workspace = Some(previous);
+        }
+    }
+
+    /// The back-and-forth target shared by all displays, by position.
+    pub(crate) fn global_last_workspace(&self) -> Option<usize> { self.global_last_workspace }
 
     fn resolve_layout_mode_for_workspace(&self, index: usize, name: &str) -> LayoutMode {
         // Check workspace_rules (last matching rule wins, like app_rules)
@@ -1669,6 +1694,37 @@ mod tests {
             window_store.workspace_info_for_window(window),
             Some(old_assignment)
         );
+    }
+
+    #[test]
+    fn global_last_workspace_persists_and_is_optional_in_older_layout_files() {
+        let mut store = WorkspaceStore::new();
+        assert_eq!(store.global_last_workspace(), None);
+        store.note_focused_workspace(2);
+        assert_eq!(
+            store.global_last_workspace(),
+            None,
+            "no earlier focus to return to"
+        );
+        store.note_focused_workspace(2);
+        store.note_focused_workspace(0);
+        assert_eq!(store.global_last_workspace(), Some(2));
+
+        let serialized = ron::ser::to_string(&store).unwrap();
+        let restored: WorkspaceStore = ron::from_str(&serialized).unwrap();
+        assert_eq!(restored.global_last_workspace(), Some(2));
+
+        let older = serialized.replace(",global_last_workspace:Some(2)", "");
+        assert_ne!(older, serialized, "the field should be in the serialized form");
+        let restored: WorkspaceStore = ron::from_str(&older).unwrap();
+        assert_eq!(restored.global_last_workspace(), None);
+        // The focused workspace is live state: after a restore the first focus
+        // seen does not overwrite the restored target.
+        let mut restored: WorkspaceStore = ron::from_str(&serialized).unwrap();
+        restored.note_focused_workspace(0);
+        assert_eq!(restored.global_last_workspace(), Some(2));
+        restored.note_focused_workspace(1);
+        assert_eq!(restored.global_last_workspace(), Some(0));
     }
 
     #[test]

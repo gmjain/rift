@@ -9215,3 +9215,44 @@ fn global_workspaces_move_a_window_to_an_unowned_workspace_on_the_focused_displa
     assert_eq!(active_workspace_index_of(&reactor, right_space), Some(3));
     assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
 }
+
+#[test]
+fn global_workspaces_share_one_back_and_forth_target() {
+    let mut settings = global_workspace_settings(4);
+    settings.workspace_auto_back_and_forth = true;
+    let (mut apps, mut reactor, left_space, right_space) = two_display_global_reactor(settings);
+
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(3));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(3));
+    // Focusing the right display makes ws1 the focused workspace and ws3 the last.
+    focus_display_space(&mut reactor, right_space);
+
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToLastWorkspace);
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(
+        reactor.space_state.command_space,
+        Some(left_space),
+        "back-and-forth returns to ws3 on the left display"
+    );
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(3));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+
+    // Switching to the workspace already showing here goes back as well.
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(3));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(3));
+
+    // A plain switch on one display is the last for the other too.
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(2));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(2));
+    focus_display_space(&mut reactor, left_space);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToLastWorkspace);
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(2));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(3));
+}
