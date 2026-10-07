@@ -8054,6 +8054,30 @@ fn left_right_bindings() -> Vec<Option<DisplaySelector>> {
     vec![left(), left(), right(), right()]
 }
 
+#[test]
+fn displays_prefer_unbound_workspaces_over_ones_bound_to_absent_displays() {
+    // ws0 is bound to the left display, ws1 to one that is not connected.
+    let bindings = vec![
+        Some(DisplaySelector::Uuid("test-display-0".into())),
+        Some(DisplaySelector::Uuid("absent-display".into())),
+        None,
+        None,
+    ];
+    let mut reactor = bound_reactor(bound_workspace_settings(bindings));
+    let (left_space, right_space) = (SpaceId::new(1), SpaceId::new(2));
+    reactor.handle_event(space_state_event(vec![left_screen(), right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]));
+    let workspaces = reactor.layout_manager.layout_engine.workspaces();
+    assert_eq!(workspaces.starting_workspace(left_space), 0);
+    assert_eq!(
+        workspaces.starting_workspace(right_space),
+        2,
+        "the first unbound workspace, not the one bound to an absent display"
+    );
+}
+
 fn bound_reactor(settings: crate::common::config::VirtualWorkspaceSettings) -> Reactor {
     let mut reactor = test_reactor_with_workspace_settings(&settings);
     reactor.config.virtual_workspaces = settings;
@@ -8498,4 +8522,118 @@ fn workspace_scope_changes_wait_for_a_restart() {
         WorkspaceScope::PerDisplay,
         "the scope rift started with stays until a restart"
     );
+}
+
+/// Settings with `count` workspaces named `ws0`, `ws1`, … shared by all displays.
+fn global_workspace_settings(count: usize) -> crate::common::config::VirtualWorkspaceSettings {
+    use crate::common::config::{VirtualWorkspaceSettings, WorkspaceScope};
+    VirtualWorkspaceSettings {
+        default_workspace_count: count,
+        workspace_names: (0..count).map(|index| format!("ws{index}")).collect(),
+        scope: WorkspaceScope::Global,
+        ..Default::default()
+    }
+}
+
+/// Two displays sharing four workspaces: the left one shows ws0 with two
+/// windows, the right one ws1.
+fn two_display_global_reactor(
+    settings: crate::common::config::VirtualWorkspaceSettings,
+) -> (Apps, Reactor, SpaceId, SpaceId) {
+    let mut reactor = bound_reactor(settings);
+    let (left_space, right_space) = (SpaceId::new(1), SpaceId::new(2));
+    connect_displays(&mut reactor, vec![left_screen(), right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]);
+    let mut apps = Apps::new();
+    apps.make_app_and_settle(&mut reactor, 1, make_windows(2));
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+    (apps, reactor, left_space, right_space)
+}
+
+fn focus_display_space(reactor: &mut Reactor, space: SpaceId) {
+    reactor.handle_event(Event::ActiveDisplayChanged {
+        menu_bar_space: Some(space),
+        command_space: Some(space),
+    });
+    assert_eq!(reactor.space_state.command_space, Some(space));
+}
+
+fn active_workspace_index_of(reactor: &Reactor, space: SpaceId) -> Option<usize> {
+    reactor
+        .layout_manager
+        .layout_engine
+        .workspaces()
+        .active_workspace_idx(space)
+        .map(|index| index as usize)
+}
+
+#[test]
+fn global_workspaces_start_each_display_on_a_workspace_no_other_display_owns() {
+    let mut reactor = bound_reactor(global_workspace_settings(4));
+    let (left_space, right_space) = (SpaceId::new(1), SpaceId::new(2));
+    connect_displays(&mut reactor, vec![left_screen()], vec![Some(left_space)]);
+    let mut apps = Apps::new();
+    apps.make_app_and_settle(&mut reactor, 1, make_windows(1));
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(1));
+
+    connect_displays(&mut reactor, vec![left_screen(), right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]);
+    assert_eq!(
+        active_workspace_index_of(&reactor, right_space),
+        Some(2),
+        "ws0 holds the left display's window and ws1 is showing there"
+    );
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(1));
+
+    // Two displays connected at once never start on the same workspace.
+    let mut reactor = bound_reactor(global_workspace_settings(4));
+    connect_displays(&mut reactor, vec![left_screen(), right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]);
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+}
+
+#[test]
+fn global_workspaces_cycle_over_a_displays_own_and_the_unowned_workspaces() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    // The right display shows ws2 while a window opens there, then goes back
+    // to ws1: ws1 shows there and ws2 holds a window parked there.
+    focus_display_space(&mut reactor, right_space);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(2));
+    let mut on_right = make_window(1);
+    on_right.frame = CGRect::new(CGPoint::new(1200., 100.), CGSize::new(400., 400.));
+    apps.make_app_and_settle(&mut reactor, 2, vec![on_right]);
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, WindowId::new(2, 1)),
+        Some(right_workspaces[2])
+    );
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    focus_display_space(&mut reactor, left_space);
+    let active = |reactor: &Reactor| active_workspace_index_of(reactor, left_space);
+
+    reactor.handle_test_layout_command(LayoutCommand::NextWorkspace(None));
+    assert_eq!(
+        active(&reactor),
+        Some(3),
+        "ws1 and ws2 belong to the right display"
+    );
+    reactor.handle_test_layout_command(LayoutCommand::NextWorkspace(None));
+    assert_eq!(active(&reactor), Some(0));
+    reactor.handle_test_layout_command(LayoutCommand::PrevWorkspace(None));
+    assert_eq!(active(&reactor), Some(3));
+    reactor.handle_test_layout_command(LayoutCommand::PrevWorkspace(None));
+    assert_eq!(active(&reactor), Some(0));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
 }
