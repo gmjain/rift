@@ -15,7 +15,7 @@
 //! The harness stands in for the raise manager and WindowServer: focus raises run FIFO; raising
 //! a window of a non-frontmost app activates it, and when that window sits on the other display
 //! the menu bar (and the cover window) move there.
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
@@ -32,8 +32,12 @@ const CHROME: pid_t = 400_001;
 const FIREFOX: pid_t = 400_002;
 /// Parked windows get one app each (pid PARKED_PID + i), so their wsids sort in spec order.
 const PARKED_PID: pid_t = 400_100;
+/// Floating windows in the shown workspaces get one app each (pid FLOAT_PID + i).
+pub(super) const FLOAT_PID: pid_t = 400_200;
+/// A second tiled window on the built-in display, next to Chrome.
+pub(super) const TILED2: pid_t = 400_003;
 /// Parked windows of the reported incident in wsid order: B = built-in, E = external display.
-const INCIDENT_PARKED: &str = "BEEBBBBBEBBB";
+pub(super) const INCIDENT_PARKED: &str = "BEEBBBBBEBBB";
 /// The menu bar cover window: not tracked by rift, follows the active menu bar.
 const COVER: u32 = 4_100_000_001;
 
@@ -46,35 +50,68 @@ fn wsid_of(wid: WindowId) -> WindowServerId {
     WindowServerId::new((wid.pid as u32) * 10_000 + wid.idx.get())
 }
 
-fn focus_targets(raises: &[RaiseRequest]) -> Vec<WindowId> {
+pub(super) fn focus_targets(raises: &[RaiseRequest]) -> Vec<WindowId> {
     raises
         .iter()
         .filter_map(|request| request.focus_window.map(|(wid, _)| wid))
         .collect()
 }
 
-struct Storm {
-    apps: Apps,
-    reactor: Reactor,
+/// The two-display setup a `Storm` is built from.
+#[derive(Clone, Copy, Default)]
+pub(super) struct StormSpec<'a> {
+    /// One char per window parked in an inactive workspace, in wsid order; 'B' = built-in,
+    /// 'E' = external display.
+    pub parked: &'a str,
+    /// Parked windows float.
+    pub parked_floating: bool,
+    /// One set of workspaces shared by both displays (four of them: the built-in shows ws0
+    /// and parks in ws1, the external shows ws2 and parks in ws3) instead of a set per display
+    /// (three each: ws0 shown, ws1 parked).
+    pub global: bool,
+    /// One char per floating window in a shown workspace ('B'/'E'), one app each, launched in
+    /// this order (so this is their focus order to start with).
+    pub floats: &'a str,
+    /// A second tiled window (`TILED2`) next to Chrome on the built-in display.
+    pub tiled2: bool,
+    /// A second, floating Chrome window (`Storm::chrome_float`) on the built-in display.
+    pub chrome_float: bool,
+    /// `settings.floating_windows_on_top`.
+    pub floating_on_top: bool,
+}
+
+pub(super) struct Storm {
+    pub apps: Apps,
+    pub reactor: Reactor,
     raise_rx: actor::Receiver<raise_manager::Event>,
     screens: Vec<CGRect>,
-    builtin: SpaceId,
-    external: SpaceId,
+    pub builtin: SpaceId,
+    pub external: SpaceId,
     native_space: BTreeMap<WindowServerId, SpaceId>,
-    chrome: WindowId,
-    firefox: WindowId,
-    parked: Vec<WindowId>,
-    menu: SpaceId,
-    front: pid_t,
+    pub chrome: WindowId,
+    pub firefox: WindowId,
+    pub tiled2: WindowId,
+    pub chrome_float: WindowId,
+    pub parked: Vec<WindowId>,
+    pub floats: Vec<WindowId>,
+    /// Apps that activate themselves when one of their windows is restacked.
+    pub self_activating: HashSet<pid_t>,
+    pub menu: SpaceId,
+    pub front: pid_t,
 }
 
 #[derive(Debug, Default)]
-struct Tally {
-    focus_raises: usize,
-    noop_raises: usize,
-    activations: usize,
-    display_flips: usize,
-    queue_left: usize,
+pub(super) struct Tally {
+    pub focus_raises: usize,
+    pub noop_raises: usize,
+    pub activations: usize,
+    pub display_flips: usize,
+    pub queue_left: usize,
+    /// Float passes run (requests with restack windows) and windows restacked in them.
+    pub passes: usize,
+    pub restacks: usize,
+    /// Activations by apps that activate themselves when restacked.
+    pub self_activations: usize,
 }
 
 impl Storm {
@@ -84,16 +121,44 @@ impl Storm {
         Self::with_scope(parked, parked_floating, false)
     }
 
-    /// `global`: one set of workspaces shared by both displays (four of them: the built-in
-    /// shows ws0 and parks in ws1, the external shows ws2 and parks in ws3) instead of a set
-    /// per display (three each: ws0 shown, ws1 parked).
+    /// See [`StormSpec::global`].
     fn with_scope(parked: &str, parked_floating: bool, global: bool) -> Storm {
+        Self::from_spec(StormSpec {
+            parked,
+            parked_floating,
+            global,
+            ..Default::default()
+        })
+    }
+
+    pub(super) fn from_spec(spec: StormSpec) -> Storm {
+        let StormSpec {
+            parked,
+            parked_floating,
+            global,
+            floats,
+            tiled2,
+            chrome_float,
+            floating_on_top,
+        } = spec;
         window_server::set_test_no_cursor_window(true);
         window_server::set_space_window_list_for_connection_override(Some(vec![]));
         let builtin = SpaceId::new(1);
         let external = SpaceId::new(708);
-        let rules = (0..parked.len()).filter(|_| parked_floating).map(|i| AppWorkspaceRule {
-            app_id: Some(format!("com.testapp{}", PARKED_PID + i as pid_t)),
+        let parked_rules =
+            (0..parked.len()).filter(|_| parked_floating).map(|i| AppWorkspaceRule {
+                app_id: Some(format!("com.testapp{}", PARKED_PID + i as pid_t)),
+                floating: true,
+                ..Default::default()
+            });
+        let float_rules = (0..floats.len()).map(|i| AppWorkspaceRule {
+            app_id: Some(format!("com.testapp{}", FLOAT_PID + i as pid_t)),
+            floating: true,
+            ..Default::default()
+        });
+        let chrome_float_rule = chrome_float.then(|| AppWorkspaceRule {
+            app_id: Some(format!("com.testapp{CHROME}")),
+            title_substring: Some("float".into()),
             floating: true,
             ..Default::default()
         });
@@ -104,11 +169,12 @@ impl Storm {
             } else {
                 WorkspaceScope::PerDisplay
             },
-            app_rules: rules.collect(),
+            app_rules: parked_rules.chain(float_rules).chain(chrome_float_rule).collect(),
             ..Default::default()
         };
         let mut reactor = test_reactor_with_workspace_settings(&settings);
         reactor.config.virtual_workspaces = settings;
+        reactor.config.settings.floating_windows_on_top = floating_on_top;
         let (raise_tx, raise_rx) = actor::channel();
         reactor.communication_manager.raise_manager_tx = raise_tx;
         // Built-in and a portrait display left of it (menu bars excluded).
@@ -126,7 +192,11 @@ impl Storm {
             native_space: BTreeMap::new(),
             chrome: WindowId::new(CHROME, 1),
             firefox: WindowId::new(FIREFOX, 1),
+            tiled2: WindowId::new(TILED2, 1),
+            chrome_float: WindowId::new(CHROME, 2),
             parked: vec![],
+            floats: vec![],
+            self_activating: HashSet::new(),
             menu: builtin,
             front: CHROME,
         };
@@ -162,18 +232,46 @@ impl Storm {
             let show = storm.reactor.test_workspace(space, shown);
             assert!(storm.reactor.set_test_active_workspace(space, show));
         }
-        storm.launch(CHROME, builtin, vec![make_window_info(
+        let mut chrome_windows = vec![make_window_info(
             rect(5., 40., 1790., 1124.),
             None,
             "Chrome",
             None,
-        )]);
+        )];
+        if chrome_float {
+            chrome_windows.push(make_window_info(
+                rect(300., 300., 500., 300.),
+                None,
+                "Chrome float",
+                None,
+            ));
+        }
+        storm.launch(CHROME, builtin, chrome_windows);
+        if tiled2 {
+            storm.launch(TILED2, builtin, vec![make_window_info(
+                rect(900., 40., 895., 1124.),
+                None,
+                "Tiled2",
+                None,
+            )]);
+        }
         storm.launch(FIREFOX, external, vec![make_window_info(
             rect(-1435., -975., 1430., 2524.),
             None,
             "Firefox",
             None,
         )]);
+        // Floating windows in the shown workspaces, launched in spec order.
+        for (i, display) in floats.chars().enumerate() {
+            let pid = FLOAT_PID + i as pid_t;
+            let (space, frame) = match display {
+                'B' => (builtin, rect(200. + 50. * i as f64, 200., 600., 400.)),
+                'E' => (external, rect(-1300. + 50. * i as f64, -800., 600., 400.)),
+                other => panic!("bad display {other:?}"),
+            };
+            storm.floats.push(WindowId::new(pid, 1));
+            storm.launch(pid, space, vec![make_window_info(frame, None, "float", None)]);
+        }
         storm.reactor.update_layout_or_warn(false, false, None);
         storm.apps.simulate_until_quiet(&mut storm.reactor);
 
@@ -185,12 +283,35 @@ impl Storm {
         storm.reactor.handle_event(Event::WindowServerFocusChanged(chrome, builtin));
         storm.apps.simulate_until_quiet(&mut storm.reactor);
 
-        assert_eq!(storm.reactor.test_active_workspace_windows(builtin), vec![
-            chrome
-        ]);
-        assert_eq!(storm.reactor.test_active_workspace_windows(external), vec![
-            firefox
-        ]);
+        let mut builtin_shown = vec![chrome];
+        if tiled2 {
+            builtin_shown.push(storm.tiled2);
+        }
+        if chrome_float {
+            builtin_shown.push(storm.chrome_float);
+        }
+        let mut external_shown = vec![firefox];
+        for &wid in &storm.floats {
+            assert!(storm.reactor.layout_manager.layout_engine.is_window_floating(wid));
+            assert!(storm.reactor.state.windows.is_visible_admitted(wid), "{wid:?}");
+            if storm.space_of(wid) == builtin {
+                builtin_shown.push(wid);
+            } else {
+                external_shown.push(wid);
+            }
+        }
+        let sorted = |mut windows: Vec<WindowId>| {
+            windows.sort();
+            windows
+        };
+        assert_eq!(
+            sorted(storm.reactor.test_active_workspace_windows(builtin)),
+            sorted(builtin_shown)
+        );
+        assert_eq!(
+            sorted(storm.reactor.test_active_workspace_windows(external)),
+            sorted(external_shown)
+        );
         for &wid in &storm.parked {
             assert!(
                 storm.reactor.state.windows.is_visible_admitted(wid),
@@ -224,7 +345,7 @@ impl Storm {
 
     /// Authoritative snapshot as forwarded by the spaces actor. `cover`: space of the menu bar
     /// cover window (None = no such window).
-    fn snapshot(&self, menu: SpaceId, cover: Option<SpaceId>) -> Event {
+    pub(super) fn snapshot(&self, menu: SpaceId, cover: Option<SpaceId>) -> Event {
         let native = self.native_space.clone();
         space_state_event_with(
             self.screens.clone(),
@@ -242,7 +363,7 @@ impl Storm {
         )
     }
 
-    fn drain_raises(&mut self) -> Vec<RaiseRequest> {
+    pub(super) fn drain_raises(&mut self) -> Vec<RaiseRequest> {
         let mut requests = vec![];
         while let Ok((_, event)) = self.raise_rx.try_recv() {
             if let raise_manager::Event::RaiseRequest(request) = event {
@@ -252,12 +373,62 @@ impl Storm {
         requests
     }
 
-    fn space_of(&self, wid: WindowId) -> SpaceId { self.native_space[&wsid_of(wid)] }
+    pub(super) fn space_of(&self, wid: WindowId) -> SpaceId { self.native_space[&wsid_of(wid)] }
 
     /// A workspace command as the user's hotkey sends it, acting on the display with focus.
-    fn command(&mut self, command: LayoutCommand) {
+    pub(super) fn command(&mut self, command: LayoutCommand) {
         self.reactor.handle_test_layout_command(command);
         self.apps.simulate_until_quiet(&mut self.reactor);
+    }
+
+    /// What macOS reports when `wid`'s app becomes the front app with `wid` key: the Carbon
+    /// activation, the WindowServer focus change and, when `wid` sits on the other display, the
+    /// menu bar (and its cover) moving there and the snapshot that follows. `quiet`: the app
+    /// thread attributes the activation to rift (it followed a raise or restack of its own).
+    fn activate(
+        &mut self,
+        wid: WindowId,
+        cover_follows_menu_bar: bool,
+        tally: &mut Tally,
+        quiet: bool,
+    ) {
+        self.front = wid.pid;
+        if quiet {
+            self.apps.quiet_activations.insert(wid.pid);
+        }
+        self.reactor.handle_event(Event::ApplicationGloballyActivated(wid.pid));
+        self.apps.simulate_until_quiet(&mut self.reactor);
+        self.apps.quiet_activations.remove(&wid.pid);
+        let space = self.space_of(wid);
+        self.reactor.handle_event(Event::WindowServerFocusChanged(wid, space));
+        if space != self.menu {
+            tally.display_flips += 1;
+            self.menu = space;
+            let snapshot = self.snapshot(space, cover_follows_menu_bar.then_some(space));
+            self.reactor.handle_event(snapshot);
+        }
+        self.apps.simulate_until_quiet(&mut self.reactor);
+    }
+
+    /// A click on `wid`: its app becomes front (if it was not) and `wid` key. Raise requests
+    /// this causes stay queued (see `drain_raises` / `drive`).
+    pub(super) fn click(&mut self, wid: WindowId, cover_follows_menu_bar: bool) {
+        let mut tally = Tally::default();
+        if self.front != wid.pid {
+            self.activate(wid, cover_follows_menu_bar, &mut tally, false);
+        } else {
+            // Another window of the front app: only the WindowServer focus report.
+            let space = self.space_of(wid);
+            self.reactor.handle_event(Event::WindowServerFocusChanged(wid, space));
+            self.apps.simulate_until_quiet(&mut self.reactor);
+        }
+    }
+
+    /// `wid`'s app activates itself in response to a restack of `wid` (the app thread reports
+    /// the activation as rift's own).
+    pub(super) fn self_activate(&mut self, wid: WindowId, cover_follows_menu_bar: bool) {
+        let mut tally = Tally::default();
+        self.activate(wid, cover_follows_menu_bar, &mut tally, true);
     }
 
     /// One authoritative snapshot (as after an active-display change), then execute focus raises
@@ -270,40 +441,39 @@ impl Storm {
         self.drive(cover_follows_menu_bar, max_raises)
     }
 
-    /// Execute the queued focus raises FIFO like the raise manager, feeding the resulting
-    /// activations (and, on a cross-display one, the menu bar move) back.
-    fn drive(&mut self, cover_follows_menu_bar: bool, max_raises: usize) -> Tally {
+    /// Execute the queued raise requests FIFO like the raise manager, feeding the resulting
+    /// activations (and, on a cross-display one, the menu bar move) back. Restacks (AXRaise
+    /// without activation) activate nothing, except for apps in `self_activating`.
+    pub(super) fn drive(&mut self, cover_follows_menu_bar: bool, max_raises: usize) -> Tally {
         let mut tally = Tally::default();
-        let cover = |menu| cover_follows_menu_bar.then_some(menu);
         let mut queue: VecDeque<RaiseRequest> = self.drain_raises().into();
         while let Some(request) = queue.pop_front() {
-            if tally.focus_raises == max_raises {
+            if tally.focus_raises + tally.passes == max_raises {
                 tally.queue_left = queue.len() + 1;
                 break;
             }
-            let Some((wid, _warp)) = request.focus_window else {
-                continue;
-            };
-            tally.focus_raises += 1;
-            if self.front == wid.pid {
-                // Frontmost app's main window: the raise completes without activating anything.
-                tally.noop_raises += 1;
-            } else {
-                // make_key_window (SetFrontProcess) + AXRaise -> activation notifications.
-                tally.activations += 1;
-                self.front = wid.pid;
-                self.reactor.handle_event(Event::ApplicationGloballyActivated(wid.pid));
-                self.apps.simulate_until_quiet(&mut self.reactor);
-                let space = self.space_of(wid);
-                self.reactor.handle_event(Event::WindowServerFocusChanged(wid, space));
-                if space != self.menu {
-                    // Key window on the other display: menu bar (and its cover) move there.
-                    tally.display_flips += 1;
-                    self.menu = space;
-                    let snapshot = self.snapshot(space, cover(space));
-                    self.reactor.handle_event(snapshot);
+            if let Some((wid, _warp)) = request.focus_window {
+                tally.focus_raises += 1;
+                if self.front == wid.pid {
+                    // Frontmost app's main window: the raise completes without activating
+                    // anything.
+                    tally.noop_raises += 1;
+                } else {
+                    // make_key_window (SetFrontProcess) + AXRaise -> activation notifications,
+                    // attributed to rift by the app thread.
+                    tally.activations += 1;
+                    self.activate(wid, cover_follows_menu_bar, &mut tally, true);
                 }
-                self.apps.simulate_until_quiet(&mut self.reactor);
+            }
+            if !request.restack_windows.is_empty() {
+                tally.passes += 1;
+                tally.restacks += request.restack_windows.len();
+                for &wid in &request.restack_windows {
+                    if self.self_activating.contains(&wid.pid) && self.front != wid.pid {
+                        tally.self_activations += 1;
+                        self.activate(wid, cover_follows_menu_bar, &mut tally, true);
+                    }
+                }
             }
             queue.extend(self.drain_raises());
         }

@@ -3560,6 +3560,19 @@ impl LayoutEngine {
             .is_some_and(|decision| decision.workspace.is_some())
     }
 
+    /// The floating windows of `space`'s active workspace (unordered).
+    pub(crate) fn active_floating_windows(&self, space: SpaceId) -> Vec<WindowId> {
+        self.floating.active_flat(space)
+    }
+
+    /// Whether `window_id` is a floating window shown fullscreen (`toggle_fullscreen`).
+    pub(crate) fn floating_fullscreen_kind(
+        &self,
+        window_id: WindowId,
+    ) -> Option<FloatingFullscreenKind> {
+        self.floating.fullscreen_kind(window_id)
+    }
+
     pub fn is_window_floating(&self, window_id: WindowId) -> bool {
         self.floating.is_floating(window_id)
             || self.workspaces.workspaces.values().any(|ws| {

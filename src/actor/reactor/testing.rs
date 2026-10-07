@@ -5,7 +5,7 @@ use super::{Event, EventOutcome, Reactor, Record, Requested, ScreenInfo, Transac
 use crate::actor;
 use crate::actor::app::{AppThreadHandle, Quiet, Request, WindowId};
 use crate::actor::spaces::ForwardedSpaceState;
-use crate::common::collections::BTreeMap;
+use crate::common::collections::{BTreeMap, HashSet};
 use crate::common::config::Config;
 use crate::layout_engine::{LayoutCommand, LayoutEngine};
 use crate::sys::app::{AppInfo, WindowInfo, pid_t};
@@ -450,6 +450,9 @@ pub struct Apps {
     tx: actor::Sender<Request>,
     rx: actor::Receiver<Request>,
     pub windows: BTreeMap<WindowId, TestWindowState>,
+    /// Apps whose next activations are reported as rift's own (`Quiet::Yes`), as the app
+    /// thread does for an activation within a second of a raise or restack it performed.
+    pub quiet_activations: HashSet<pid_t>,
 }
 
 #[derive(Default, PartialEq, Debug, Clone)]
@@ -467,6 +470,7 @@ impl Apps {
             tx,
             rx,
             windows: BTreeMap::new(),
+            quiet_activations: HashSet::default(),
         }
     }
 
@@ -604,7 +608,12 @@ impl Apps {
                     }
                 }
                 Request::ApplicationGloballyActivated(pid) => {
-                    events.push(Event::ApplicationActivated(pid, Quiet::No));
+                    let quiet = if self.quiet_activations.contains(&pid) {
+                        Quiet::Yes
+                    } else {
+                        Quiet::No
+                    };
+                    events.push(Event::ApplicationActivated(pid, quiet));
                 }
                 Request::SetWindowFrames(frames, txid, mode, _) => {
                     for (wid, frame) in frames {
@@ -665,7 +674,7 @@ impl Apps {
                         None,
                     ));
                 }
-                Request::Raise(..) => todo!(),
+                Request::Raise(..) | Request::Restack(..) => todo!(),
                 Request::CloseWindow(..) => todo!(),
             }
         }
