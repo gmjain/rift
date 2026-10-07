@@ -80,6 +80,20 @@ run_on_start = []
 # - If false, your config changes will only apply when restarting rift.
 hot_reload = true
 
+# Layout file (~/.rift/layout.ron): workspaces, layout trees and floating windows.
+# `save-and-exit` and `save-layout` write it; `rift --restore` reads it at startup.
+# - autosave: also save it shortly after every layout change, so a restart or a crash
+#   can restore the layout. Written atomically, off the event loop.
+# - autosave_debounce_ms: wait this long after the first change before saving; changes in
+#   the meantime join that save (at least 100).
+# - restore_on_start: restore the file at startup, as `rift --restore` does.
+#   Windows are matched by their WindowServer id while their app keeps running, by app
+#   and title otherwise.
+[settings.persistence]
+autosave = false
+autosave_debounce_ms = 1000
+restore_on_start = false
+
 [settings.layout]
 # Layout Types:
 #   - "traditional" (i3/sway-like containers)
