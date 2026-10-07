@@ -447,6 +447,7 @@ pub fn handle_mouse_moved_over_window(
             crate::actor::raise_manager::RaiseRequest {
                 raise_windows: vec![vec![window]],
                 focus_window: Some((window, None)),
+                restack_windows: vec![],
                 app_handles,
                 focus_quiet: Quiet::Yes,
             },

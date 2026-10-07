@@ -557,6 +557,13 @@ pub enum Request {
     /// parameter for the last window only. Events for other windows will be
     /// marked `Quiet::Yes` automatically.
     Raise(Vec<WindowId>, CancellationToken, u64, Quiet),
+    /// Order the windows to the front, in the given order (last on top), without
+    /// activating the app: an AX raise per window, no make-key, no activation
+    /// wait. Used to keep floating windows above tiled ones. Should the app
+    /// activate itself in response, the activation is attributed to this request
+    /// (quiet). A window that cannot be raised is skipped; every window is
+    /// completed.
+    Restack(Vec<WindowId>, CancellationToken, u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,7 +586,10 @@ impl Request {
     }
 }
 
-struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
+enum RaiseRequest {
+    Raise(Vec<WindowId>, CancellationToken, u64, Quiet),
+    Restack(Vec<WindowId>, CancellationToken, u64),
+}
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum Quiet {
@@ -952,7 +962,16 @@ impl State {
 
     async fn handle_raises(this: &RefCell<Self>, mut rx: actor::Receiver<RaiseRequest>) {
         while let Some((span, raise)) = rx.recv().await {
-            let RaiseRequest(wids, token, sequence_id, quiet) = raise;
+            let (wids, token, sequence_id, quiet) = match raise {
+                RaiseRequest::Raise(wids, token, sequence_id, quiet) => {
+                    (wids, token, sequence_id, quiet)
+                }
+                RaiseRequest::Restack(wids, token, sequence_id) => {
+                    let _guard = span.enter();
+                    Self::handle_restack_request(this, &wids, &token, sequence_id);
+                    continue;
+                }
+            };
             if let Err(e) = Self::handle_raise_request(this, &wids, &token, sequence_id, quiet)
                 .instrument(span)
                 .await
@@ -1275,7 +1294,10 @@ impl State {
                 ));
             }
             Request::Raise(wids, token, sequence_id, quiet) => {
-                self.raises_tx.send(RaiseRequest(wids, token, sequence_id, quiet));
+                self.raises_tx.send(RaiseRequest::Raise(wids, token, sequence_id, quiet));
+            }
+            Request::Restack(wids, token, sequence_id) => {
+                self.raises_tx.send(RaiseRequest::Restack(wids, token, sequence_id));
             }
         }
         Ok(false)
@@ -1626,6 +1648,54 @@ impl State {
         }
 
         Ok(())
+    }
+
+    /// Order `wids` to the front in the given order without activating the app.
+    ///
+    /// AXRaise orders a window to the front of its layer; app activation is a
+    /// separate WindowServer call (`make_key_window`) that this path never makes.
+    /// So the floats of other apps end up above the focused window while that
+    /// window keeps focus. Some apps activate themselves on AXRaise anyway; that
+    /// activation is marked as rift's own (quiet) so the reactor neither switches
+    /// workspaces nor re-raises for it. Every window is completed, raised or not,
+    /// so the sequence never waits on a window that has gone away.
+    fn handle_restack_request(
+        this_ref: &RefCell<Self>,
+        wids: &[WindowId],
+        token: &CancellationToken,
+        sequence_id: u64,
+    ) {
+        let mut this = this_ref.borrow_mut();
+        if !token.is_cancelled() {
+            this.note_quiet_activation(wids.last().copied());
+        }
+        for &wid in wids {
+            debug_assert_eq!(wid.pid, this.pid);
+            if token.is_cancelled() {
+                debug!(?wid, "Restack cancelled");
+            } else {
+                match this.window(wid) {
+                    Ok(window) => {
+                        if let Err(err) = trace("restack", &window.elem, || window.elem.raise()) {
+                            debug!(?wid, ?err, "Restack failed to raise window");
+                        }
+                    }
+                    Err(err) => debug!(?wid, ?err, "Restack target unknown; skipping"),
+                }
+            }
+            this.send_event(Event::RaiseCompleted { window_id: wid, sequence_id });
+        }
+    }
+
+    /// Attribute an activation of this app within the next second to rift
+    /// (`Quiet::Yes`), with `window` as the quiet main-window change.
+    fn note_quiet_activation(&mut self, window: Option<WindowId>) {
+        let (tx, _rx) = oneshot::channel();
+        if let Some((_, _, _, prev_tx)) =
+            self.last_activated.replace((Instant::now(), Quiet::Yes, window, tx))
+        {
+            let _ = prev_tx.send(());
+        }
     }
 
     fn on_main_window_changed(

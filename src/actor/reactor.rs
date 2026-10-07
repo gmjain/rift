@@ -8,6 +8,7 @@ mod animation;
 mod autosave;
 mod borders;
 mod events;
+mod float_stack;
 mod gesture;
 pub(crate) use crate::layout_engine::WorkspaceDropRequest as OverviewDrop;
 mod main_window;
@@ -52,6 +53,8 @@ mod SpaceEventHandler {
 #[cfg(test)]
 mod border_tests;
 #[cfg(test)]
+mod floating_on_top_tests;
+#[cfg(test)]
 mod raise_storm_tests;
 #[cfg(test)]
 mod tests;
@@ -68,6 +71,7 @@ use events::{
     drag as interaction_workflow, focus as focus_service, space as topology_workflow,
     system as system_workflow, window as window_workflow,
 };
+use float_stack::{FloatPass, FloatStack};
 use main_window::MainWindowTracker;
 use managers::LayoutManager;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -444,6 +448,8 @@ pub struct Reactor {
     mission_control_manager: managers::MissionControlManager,
     window_inventory_manager: managers::WindowInventoryManager,
     refocus_manager: managers::RefocusManager,
+    /// Floating windows kept above tiled ones (`settings.floating_windows_on_top`).
+    float_stack: FloatStack,
     suppress_auto_workspace_switch_until_input: bool,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
     active_spaces: HashSet<SpaceId>,
@@ -593,6 +599,7 @@ impl Reactor {
                 stale_cleanup_state: StaleCleanupState::Enabled,
                 refocus_state: RefocusState::None,
             },
+            float_stack: FloatStack::default(),
             suppress_auto_workspace_switch_until_input: false,
             pending_space_change_manager: managers::PendingSpaceChangeManager {
                 pending_space_change: None,
@@ -1255,6 +1262,7 @@ impl Reactor {
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
         }
+        self.flush_float_pass();
         self.retire_presentations();
         self.drag_manager.sync_motion_gate();
     }
@@ -1399,6 +1407,7 @@ impl Reactor {
             Event::ApplicationThreadTerminated(pid) => {
                 self.forget_window_inventory(pid);
                 self.clear_menu_state_for_pid(pid);
+                self.float_stack.forget_app(pid);
                 return application_workflow::handle_application_thread_terminated(
                     &mut self.state,
                     &mut self.app_manager,
@@ -1407,6 +1416,12 @@ impl Reactor {
             }
             Event::ApplicationActivated(pid, quiet) => {
                 self.clear_menu_state_for_non_owner(pid);
+                if quiet == Quiet::Yes {
+                    // Quiet = the app thread attributes the activation to rift; with no
+                    // raise of this app requested, that is the app activating itself on
+                    // a restack.
+                    self.float_stack.note_app_activated(pid, Instant::now());
+                }
                 let mut outcome = application_workflow::handle_application_activated(
                     application_workflow::ApplicationActivatedPayload { pid, quiet },
                 )?;
@@ -2762,7 +2777,10 @@ impl Reactor {
 
         #[cfg(test)]
         self.event_outcome_phase_trace.push("raising");
-        for request in outcome.raise_requests {
+        for mut request in outcome.raise_requests {
+            if let raise_manager::Event::RaiseRequest(request) = &mut request {
+                self.attach_float_pass(request);
+            }
             if let Err(error) = self.communication_manager.raise_manager_tx.try_send(request) {
                 warn!(%error, "failed to send raise request");
             }
@@ -4236,6 +4254,15 @@ impl Reactor {
         let geometry_changed = response.changed;
         self.prepare_refocus_after_layout_event(&event_clone);
         self.handle_layout_response(response, workspace_switch_space);
+        // Every focus change ends here, rift's own (its raise's activation) and the ones
+        // macOS reports (a click). Queue the float pass for it; the raise request of this
+        // event takes it, or it goes out on its own once the event is done.
+        if let LayoutEvent::WindowFocused(space, window) = event_clone
+            && self.layout_manager.layout_engine.focused_window() == Some(window)
+        {
+            self.float_stack.note_focus(window);
+            self.float_stack.queue(space, window);
+        }
         if geometry_changed {
             self.update_layout_or_warn(
                 false,
@@ -4886,15 +4913,174 @@ impl Reactor {
             (wid, warp)
         });
 
-        let msg = raise_manager::Event::RaiseRequest(RaiseRequest {
+        let mut request = RaiseRequest {
             raise_windows: windows_by_app_and_screen.into_values().collect(),
             focus_window: focus_window_with_warp,
+            restack_windows: vec![],
             app_handles,
             focus_quiet,
-        });
+        };
+        self.attach_float_pass(&mut request);
+        let msg = raise_manager::Event::RaiseRequest(request);
 
         if let Err(e) = self.communication_manager.raise_manager_tx.try_send(msg) {
             warn!("Failed to send raise request to raise manager: {}", e);
+        }
+    }
+
+    /// The float pass for a focus change to the tiled window `target` on `space`: the
+    /// visible floating windows of its workspace, least recently focused first, then the
+    /// focused app's own dialogs; `None` when there is nothing to raise or no pass is due
+    /// (feature off, floating or fullscreen target, native-fullscreen Space, drag, Mission
+    /// Control). Floats of the target's own app are left out: AXRaise would hand them key
+    /// focus within the app, taking it from the target.
+    fn float_pass_for(&mut self, space: SpaceId, target: WindowId) -> Option<FloatPass> {
+        if !self.config.settings.floating_windows_on_top
+            || !self.is_space_active(space)
+            || self.is_fullscreen_space(space)
+            || self.is_in_drag()
+            || self.is_mission_control_active()
+        {
+            return None;
+        }
+        let engine = &self.layout_manager.layout_engine;
+        if engine.is_window_floating(target)
+            || !engine.workspaces().is_window_in_active_workspace(
+                &self.state.windows,
+                space,
+                target,
+            )
+        {
+            return None;
+        }
+        let target_state = self.state.windows.window(target)?;
+        if target_state
+            .info
+            .sys_id
+            .is_some_and(|wsid| self.is_known_fullscreen_window(wsid))
+        {
+            return None;
+        }
+        if self
+            .layout_manager
+            .layout_engine
+            .active_workspace_for_space_has_fullscreen(space)
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let engine = &self.layout_manager.layout_engine;
+        let visible_on_space = |wid: WindowId| {
+            wid != target
+                && self
+                    .state
+                    .windows
+                    .window(wid)
+                    .and_then(|window| window.info.sys_id)
+                    .is_some_and(|wsid| self.state.windows.is_window_visible(wsid))
+                && self.best_space_for_window_id(wid) == Some(space)
+        };
+        let floats: Vec<WindowId> = engine
+            .active_floating_windows(space)
+            .into_iter()
+            .filter(|&wid| {
+                engine
+                    .workspaces()
+                    .is_window_in_active_workspace(&self.state.windows, space, wid)
+            })
+            .filter(|&wid| wid.pid != target.pid)
+            .filter(|&wid| !self.float_stack.is_excluded(wid.pid, now))
+            .filter(|&wid| engine.floating_fullscreen_kind(wid).is_none())
+            .filter(|&wid| self.state.windows.is_visible_admitted(wid))
+            .filter(|&wid| visible_on_space(wid))
+            .collect();
+        let mut windows = self.float_stack.ordered(floats);
+        // The focused app's dialogs are not managed (so never in the layout) but tracked;
+        // they go on top of everything.
+        let mut dialogs: Vec<WindowId> = self
+            .state
+            .windows
+            .iter_windows()
+            .filter(|(wid, window)| {
+                wid.pid == target.pid
+                    && !window.is_admitted()
+                    && is_dialog(&window.info)
+                    && visible_on_space(*wid)
+            })
+            .map(|(wid, _)| wid)
+            .collect();
+        dialogs.sort();
+        windows.extend(dialogs);
+        (!windows.is_empty()).then_some(FloatPass { target, windows })
+    }
+
+    /// The pass for a focus change to `target` on `space` if one is due now (not an echo
+    /// of the pass already sent for it, not rate limited); recorded as sent.
+    fn float_pass_to_send(&mut self, space: SpaceId, target: WindowId) -> Option<FloatPass> {
+        let pass = self.float_pass_for(space, target)?;
+        self.float_stack.admit(&pass, Instant::now()).then_some(pass)
+    }
+
+    /// The floats to restack after a focus raise of `target`, taking the focus change
+    /// queued for `target` when there is one.
+    fn floats_to_restack(&mut self, target: WindowId) -> Vec<WindowId> {
+        if !self.config.settings.floating_windows_on_top {
+            return vec![];
+        }
+        let space = self
+            .float_stack
+            .take_pending_for(target)
+            .or_else(|| self.best_space_for_window_id(target));
+        space
+            .and_then(|space| self.float_pass_to_send(space, target))
+            .map(|pass| pass.windows)
+            .unwrap_or_default()
+    }
+
+    /// Append the float pass of `request`'s focus window to it, and note which apps the
+    /// request activates.
+    fn attach_float_pass(&mut self, request: &mut RaiseRequest) {
+        let raised = request
+            .raise_windows
+            .iter()
+            .filter_map(|batch| batch.first())
+            .chain(request.focus_window.as_ref().map(|(wid, _)| wid))
+            .map(|wid| wid.pid)
+            .collect::<Vec<_>>();
+        self.float_stack.note_raise(raised, Instant::now());
+        let Some((target, _)) = request.focus_window else {
+            return;
+        };
+        self.float_stack.note_focus(target);
+        let floats = self.floats_to_restack(target);
+        for &wid in &floats {
+            self.insert_app_handle_for_window(&mut request.app_handles, wid);
+        }
+        request.restack_windows = floats;
+    }
+
+    /// Send the pass queued by a focus change macOS reported (no raise request of rift's
+    /// own took it) as a sequence of its own: restacks only, nothing activated.
+    fn flush_float_pass(&mut self) {
+        let Some((space, target)) = self.float_stack.take_pending() else {
+            return;
+        };
+        let Some(pass) = self.float_pass_to_send(space, target) else {
+            return;
+        };
+        let mut app_handles = HashMap::default();
+        for &wid in &pass.windows {
+            self.insert_app_handle_for_window(&mut app_handles, wid);
+        }
+        let msg = raise_manager::Event::RaiseRequest(RaiseRequest {
+            raise_windows: vec![],
+            focus_window: None,
+            restack_windows: pass.windows,
+            app_handles,
+            focus_quiet: Quiet::Yes,
+        });
+        if let Err(e) = self.communication_manager.raise_manager_tx.try_send(msg) {
+            warn!("Failed to send float pass to raise manager: {}", e);
         }
     }
 
@@ -5671,4 +5857,11 @@ impl Reactor {
                 false
             })
     }
+}
+
+/// A dialog of an app: an `AXWindow` whose subrole is a dialog kind. Such windows are not
+/// managed (tiled) but are tracked, and are kept above the app's tiled windows.
+fn is_dialog(info: &crate::sys::app::WindowInfo) -> bool {
+    info.ax_role.as_deref() == Some("AXWindow")
+        && matches!(info.ax_subrole.as_deref(), Some("AXDialog" | "AXSystemDialog"))
 }

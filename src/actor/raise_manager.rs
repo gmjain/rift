@@ -32,6 +32,10 @@ pub struct RaiseRequest {
     pub raise_windows: Vec<Vec<WindowId>>,
     /// The window to raise and focus last.
     pub focus_window: Option<(WindowId, Option<CGPoint>)>,
+    /// Windows to order above the focus window once it is raised, bottom to top,
+    /// without activating their apps (floating windows kept above tiled ones).
+    /// Raised one app at a time so the order holds across apps.
+    pub restack_windows: Vec<WindowId>,
     pub app_handles: HashMap<i32, AppThreadHandle>,
     pub focus_quiet: Quiet,
 }
@@ -51,6 +55,8 @@ struct ActiveSequence {
     sequence_id: u64,
     pending_raises: HashSet<WindowId>,
     focus_batch: Option<(pid_t, Vec<WindowId>, Option<CGPoint>, Quiet)>,
+    /// Per-app batches still to restack after the focus window, in order.
+    restack: VecDeque<Vec<WindowId>>,
     app_handles: HashMap<i32, AppThreadHandle>,
     raise_token: CancellationToken,
     started_at: Instant,
@@ -129,18 +135,21 @@ impl RaiseManager {
             Event::RaiseRequest(RaiseRequest {
                 raise_windows,
                 focus_window,
+                restack_windows,
                 app_handles,
                 focus_quiet,
             }) => {
                 debug!(
-                    "Processing layout response with {} raise_windows",
-                    raise_windows.len()
+                    "Processing layout response with {} raise_windows, {} restack_windows",
+                    raise_windows.len(),
+                    restack_windows.len()
                 );
 
                 // Always queue the sequence
                 self.queued_sequences.push_back(RaiseRequest {
                     raise_windows,
                     focus_window,
+                    restack_windows,
                     app_handles,
                     focus_quiet,
                 });
@@ -166,6 +175,13 @@ impl RaiseManager {
                             sequence_id, sequence.pending_raises
                         );
                         sequence.pending_raises.clear();
+                        // Restacking is best effort: once the focus window is
+                        // raised (or there was none), a timeout drops the floats
+                        // still to raise rather than spending another timeout on
+                        // each of them.
+                        if sequence.focus_batch.is_none() {
+                            sequence.restack.clear();
+                        }
                         // Cancel the raises that hung, then install a fresh
                         // token. The focus raise is sent next (in
                         // process_active_sequence) and must use a live token, or
@@ -209,6 +225,7 @@ impl RaiseManager {
         RaiseRequest {
             raise_windows,
             focus_window,
+            restack_windows,
             app_handles,
             focus_quiet,
         }: RaiseRequest,
@@ -258,11 +275,21 @@ impl RaiseManager {
             focus_batch = Some((wid.pid, vec![wid], warp, focus_quiet));
         }
 
-        if !pending_raises.is_empty() || focus_batch.is_some() {
+        // Consecutive windows of one app form a batch (one request, raised in order).
+        let mut restack: VecDeque<Vec<WindowId>> = VecDeque::new();
+        for wid in restack_windows {
+            match restack.back_mut() {
+                Some(batch) if batch[0].pid == wid.pid => batch.push(wid),
+                _ => restack.push_back(vec![wid]),
+            }
+        }
+
+        if !pending_raises.is_empty() || focus_batch.is_some() || !restack.is_empty() {
             self.active_sequence = Some(ActiveSequence {
                 sequence_id,
                 pending_raises,
                 focus_batch,
+                restack,
                 app_handles,
                 raise_token,
                 started_at: Instant::now(),
@@ -313,8 +340,42 @@ impl RaiseManager {
             }
         }
 
-        // If all raises (including focus) are complete, remove the active sequence.
-        if sequence.pending_raises.is_empty() && sequence.focus_batch.is_none() {
+        // With the focus window raised, put the floats back above it: one app's
+        // batch at a time, the next only once the previous one completed, so the
+        // bottom-to-top order holds across apps.
+        while sequence.pending_raises.is_empty()
+            && sequence.focus_batch.is_none()
+            && let Some(wids) = sequence.restack.pop_front()
+        {
+            changed = true;
+            let Some(pid) = wids.first().map(|wid| wid.pid) else {
+                continue;
+            };
+            let Some(handle) = sequence.app_handles.get(&pid) else {
+                warn!("App not found for restack pid {:?}", pid);
+                continue;
+            };
+            debug!(restack_windows = ?wids);
+            if handle
+                .send(Request::Restack(
+                    wids.clone(),
+                    sequence.raise_token.clone(),
+                    sequence.sequence_id,
+                ))
+                .is_ok()
+            {
+                sequence.pending_raises.extend(wids);
+            } else {
+                warn!("Failed to send restack request");
+            }
+        }
+
+        // If all raises (including focus and restacks) are complete, remove the
+        // active sequence.
+        if sequence.pending_raises.is_empty()
+            && sequence.focus_batch.is_none()
+            && sequence.restack.is_empty()
+        {
             trace!(
                 "Raise sequence completed after {:?}",
                 sequence.started_at.elapsed(),
@@ -352,9 +413,17 @@ mod tests {
         Event::RaiseRequest(RaiseRequest {
             raise_windows: raise_windows.into_iter().map(|w| vec![w]).collect(),
             focus_window,
+            restack_windows: vec![],
             app_handles,
             focus_quiet,
         })
+    }
+
+    fn restack_request(request: &Request) -> Option<(&Vec<WindowId>, u64)> {
+        match request {
+            Request::Restack(wids, _, seq_id) => Some((wids, *seq_id)),
+            _ => None,
+        }
     }
 
     fn collect_requests(app_rx: &mut actor::Receiver<Request>) -> Vec<Request> {
@@ -797,6 +866,7 @@ mod tests {
             let raise_request = Event::RaiseRequest(RaiseRequest {
                 raise_windows: batched_windows,
                 focus_window: Some((WindowId::new(1, 7), None)),
+                restack_windows: vec![],
                 app_handles,
                 focus_quiet: Quiet::No,
             });
@@ -852,6 +922,152 @@ mod tests {
             } else {
                 panic!("Expected Raise request for first batch");
             }
+        });
+    }
+
+    /// Two apps (pids 1 and 2) sharing one request channel.
+    fn create_two_app_handles() -> (HashMap<i32, AppThreadHandle>, actor::Receiver<Request>) {
+        let (mut app_handles, app_rx) = create_test_app_handles();
+        let handle = app_handles[&1].clone();
+        app_handles.insert(2, handle);
+        (app_handles, app_rx)
+    }
+
+    #[track_caller]
+    fn assert_restack_request(request: &Request, expected: &[WindowId], expected_seq_id: u64) {
+        let (wids, seq_id) = restack_request(request)
+            .unwrap_or_else(|| panic!("Expected restack request, got: {:?}", request));
+        assert_eq!(wids.as_slice(), expected);
+        assert_eq!(seq_id, expected_seq_id);
+    }
+
+    /// Floats are restacked only after the focus window completed, bottom to top, one
+    /// app batch at a time (the next batch waits for the previous one), as plain
+    /// restack requests (no quiet/focus raise), and the sequence ends after the last.
+    #[test]
+    fn test_restack_runs_after_focus_in_order_one_app_at_a_time() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, mut app_rx) = create_two_app_handles();
+            let (w11, w12, w13, w14) = (
+                WindowId::new(1, 1),
+                WindowId::new(1, 2),
+                WindowId::new(1, 3),
+                WindowId::new(1, 4),
+            );
+            let (w21, w22) = (WindowId::new(2, 1), WindowId::new(2, 2));
+
+            raise_manager.handle_message(Event::RaiseRequest(RaiseRequest {
+                raise_windows: vec![vec![w11]],
+                focus_window: Some((w12, None)),
+                restack_windows: vec![w13, w21, w22, w14],
+                app_handles,
+                focus_quiet: Quiet::Yes,
+            }));
+
+            // Regular raise first; nothing else until it completes.
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w11, 1, Quiet::Yes);
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w11, sequence_id: 1 });
+
+            // Then the focus window, still no restack.
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w12, 1, Quiet::Yes);
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w12, sequence_id: 1 });
+
+            // First restack batch: app 1's leading window alone (app 2 follows it).
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_restack_request(&requests[0], &[w13], 1);
+            assert_eq!(raise_manager.active_sequence.as_ref().unwrap().restack.len(), 2);
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w13, sequence_id: 1 });
+
+            // App 2's two windows as one batch, in order.
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_restack_request(&requests[0], &[w21, w22], 1);
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w21, sequence_id: 1 });
+            assert!(
+                collect_requests(&mut app_rx).is_empty(),
+                "the next batch waits for the whole previous batch"
+            );
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w22, sequence_id: 1 });
+
+            // App 1's trailing window last, then the sequence is done.
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_restack_request(&requests[0], &[w14], 1);
+            assert!(raise_manager.active_sequence.is_some());
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w14, sequence_id: 1 });
+            assert!(raise_manager.active_sequence.is_none());
+            assert!(collect_requests(&mut app_rx).is_empty());
+        });
+    }
+
+    /// A request carrying only restacks (a focus change macOS reported) is a sequence of
+    /// its own: no raise, no focus, just the restack batches.
+    #[test]
+    fn test_restack_only_request_runs_without_focus() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, mut app_rx) = create_test_app_handles();
+            let (w1, w2) = (WindowId::new(1, 1), WindowId::new(1, 2));
+
+            raise_manager.handle_message(Event::RaiseRequest(RaiseRequest {
+                raise_windows: vec![],
+                focus_window: None,
+                restack_windows: vec![w1, w2],
+                app_handles,
+                focus_quiet: Quiet::Yes,
+            }));
+
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_restack_request(&requests[0], &[w1, w2], 1);
+            assert!(raise_manager.active_sequence.is_some());
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w1, sequence_id: 1 });
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w2, sequence_id: 1 });
+            assert!(raise_manager.active_sequence.is_none());
+        });
+    }
+
+    /// A timeout while restacking drops the floats still to raise (best effort) instead of
+    /// spending another timeout on each; a timeout before the focus raise keeps them.
+    #[test]
+    fn test_timeout_drops_remaining_restacks_only_after_focus() {
+        Executor::run(async {
+            // Before the focus raise: the restacks survive the timeout.
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, mut app_rx) = create_two_app_handles();
+            let (w11, w12, w13, w21) = (
+                WindowId::new(1, 1),
+                WindowId::new(1, 2),
+                WindowId::new(1, 3),
+                WindowId::new(2, 1),
+            );
+            raise_manager.handle_message(Event::RaiseRequest(RaiseRequest {
+                raise_windows: vec![vec![w11]],
+                focus_window: Some((w12, None)),
+                restack_windows: vec![w13, w21],
+                app_handles,
+                focus_quiet: Quiet::No,
+            }));
+            let _ = collect_requests(&mut app_rx);
+            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w12, 1, Quiet::No);
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w12, sequence_id: 1 });
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_restack_request(&requests[0], &[w13], 1);
+
+            // During the restacks: the rest is dropped and the sequence ends.
+            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+            assert!(raise_manager.active_sequence.is_none());
+            assert!(collect_requests(&mut app_rx).is_empty());
         });
     }
 }

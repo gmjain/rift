@@ -368,6 +368,7 @@ fn focus_window_raise_request(apps: &AppManager, window: WindowId) -> raise_mana
     raise_manager::Event::RaiseRequest(raise_manager::RaiseRequest {
         raise_windows: Vec::new(),
         focus_window: Some((window, None)),
+        restack_windows: Vec::new(),
         app_handles,
         focus_quiet: Quiet::Yes,
     })
