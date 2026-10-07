@@ -641,6 +641,11 @@ thread_local! {
 /// `below_window_id` when given. Returns `(window_id, owner_connection_id)`,
 /// or `None` when no window is found.
 fn find_window_at_point(point: &mut CGPoint, below_window_id: Option<u32>) -> Option<(u32, i32)> {
+    // A real window under the real cursor is not a test fixture: the reactor would treat its
+    // id as an untracked window and make it key.
+    if cfg!(test) {
+        return None;
+    }
     let mut window_point = CGPoint { x: 0.0, y: 0.0 };
     let (mut wid, mut wcid) = (0u32, 0i32);
 
@@ -703,6 +708,10 @@ pub fn current_cursor_location() -> Result<CGPoint, CGError> {
     #[cfg(test)]
     if let Some(point) = TEST_CURSOR_LOCATION_OVERRIDE.with(std::cell::Cell::get) {
         return Ok(point);
+    }
+    // Tests have no real cursor.
+    if cfg!(test) {
+        return Err(CGError::NoneAvailable);
     }
     let mut point = CGPoint::new(0.0, 0.0);
     cg_ok(unsafe { SLSGetCurrentCursorLocation(*G_CONNECTION, &mut point) })?;
