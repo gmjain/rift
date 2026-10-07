@@ -334,3 +334,153 @@ fn a_display_that_goes_away_is_cleared() {
         "{events:?}"
     );
 }
+
+fn dim_context() -> (Apps, Reactor, actor::Receiver<BorderEvent>) {
+    let (apps, mut reactor, rx) = border_context();
+    reactor.config.settings.ui.border.enabled = false;
+    reactor.config.settings.ui.dim.enabled = true;
+    (apps, reactor, rx)
+}
+
+#[test]
+fn dimming_alone_publishes_with_server_ids_and_the_last_focused_window() {
+    let (mut apps, mut reactor, mut rx) = dim_context();
+    let (space1, space2) = (SpaceId::new(1), SpaceId::new(2));
+    reactor.handle_event(space_state_event(vec![left_screen(), right_screen()], vec![
+        Some(space1),
+        Some(space2),
+    ]));
+    apps.make_app_and_settle(&mut reactor, 1, vec![
+        make_window_info(rect(100., 100., 50., 50.), None, "left", None),
+        make_window_info(rect(1100., 100., 50., 50.), None, "right", None),
+    ]);
+    let (left, right) = (WindowId::new(1, 1), WindowId::new(1, 2));
+    let snapshots = updates(drain(&mut rx));
+    assert!(!snapshots.is_empty(), "dimming alone still publishes");
+    for snapshot in &snapshots {
+        assert!(snapshot.windows.iter().all(|window| window.server_id.is_some()));
+        assert_eq!(snapshot.last_focused, None);
+        assert!(!snapshot.reorder);
+    }
+
+    focus(&mut reactor, left, space1);
+    let _ = drain(&mut rx);
+    reactor.handle_event(Event::WindowServerFocusChanged(right, space2));
+    let mut snapshots = updates(drain(&mut rx));
+    snapshots.sort_by(|a, b| a.display_uuid.cmp(&b.display_uuid));
+    assert_eq!(snapshots.len(), 2, "{snapshots:?}");
+    // The left display keeps the hole around its last focused window.
+    assert_eq!(snapshots[0].last_focused, Some(left));
+    assert!(!snapshots[0].windows.iter().any(|window| window.focused));
+    assert!(!snapshots[0].reorder);
+    assert_eq!(snapshots[1].last_focused, Some(right));
+    assert!(snapshots[1].window(right).unwrap().focused);
+    assert!(
+        snapshots[1].reorder,
+        "the focused display re-orders under its window"
+    );
+    assert_eq!(
+        snapshots[1].window(right).unwrap().server_id,
+        Some(reactor.test_window_server_id(right).as_u32())
+    );
+}
+
+#[test]
+fn a_raise_of_the_focused_window_resends_only_its_display_for_reordering() {
+    let (mut apps, mut reactor, mut rx) = dim_context();
+    let (space1, space2) = (SpaceId::new(1), SpaceId::new(2));
+    reactor.handle_event(space_state_event(vec![left_screen(), right_screen()], vec![
+        Some(space1),
+        Some(space2),
+    ]));
+    apps.make_app_and_settle(&mut reactor, 1, vec![
+        make_window_info(rect(100., 100., 50., 50.), None, "left", None),
+        make_window_info(rect(1100., 100., 50., 50.), None, "right", None),
+    ]);
+    let left = WindowId::new(1, 1);
+    focus(&mut reactor, left, space1);
+    let _ = drain(&mut rx);
+
+    // WindowServer reports the same focus again (a raise): one message, the
+    // focused display only, flagged for re-ordering.
+    reactor.handle_event(Event::WindowServerFocusChanged(left, space1));
+    let snapshots = updates(drain(&mut rx));
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert_eq!(snapshots[0].display_uuid, "test-display-0");
+    assert!(snapshots[0].reorder);
+
+    // Repeated reports re-order a few times a second at most: a re-order that WindowServer
+    // answered with a focus report could not turn into a loop.
+    let mut resent = 0;
+    for _ in 0..20 {
+        reactor.handle_event(Event::WindowServerFocusChanged(left, space1));
+        resent += updates(drain(&mut rx)).len();
+    }
+    assert!(resent < super::borders::MAX_FORCED_REORDERS, "{resent} resends");
+    // A second later reports re-order again.
+    for times in reactor.borders.forced_at.values_mut() {
+        for at in times.iter_mut() {
+            *at -= super::borders::FORCED_REORDER_WINDOW;
+        }
+    }
+    reactor.handle_event(Event::WindowServerFocusChanged(left, space1));
+    let snapshots = updates(drain(&mut rx));
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert!(snapshots[0].reorder);
+
+    // Without dimming a repeated focus report stays silent.
+    reactor.config.settings.ui.dim.enabled = false;
+    reactor.config.settings.ui.border.enabled = true;
+    reactor.handle_event(Event::WindowServerFocusChanged(left, space1));
+    assert!(drain(&mut rx).is_empty());
+
+    // Neither enabled: nothing at all.
+    reactor.config.settings.ui.border.enabled = false;
+    reactor.handle_event(Event::WindowServerFocusChanged(WindowId::new(1, 2), space2));
+    assert!(drain(&mut rx).is_empty());
+}
+
+/// The dim overlay is a display-sized window at the normal level, owned by rift: when
+/// WindowServer reports it, rift must not take it for an app window (nor itself for an app).
+#[test]
+fn rifts_own_overlay_window_is_not_taken_for_an_app_window() {
+    let (_apps, mut reactor, _rx) = dim_context();
+    let space = SpaceId::new(1);
+    reactor.handle_event(space_state_event(vec![left_screen()], vec![Some(space)]));
+    let overlay = crate::sys::window_server::WindowServerInfo {
+        id: WindowServerId::new(4_200_000_777),
+        pid: std::process::id() as pid_t,
+        layer: 0,
+        frame: left_screen(),
+        min_frame: CGSize::new(0., 0.),
+        max_frame: CGSize::new(0., 0.),
+    };
+    let outcome = topology_workflow::handle_window_server_appeared(
+        &mut reactor.state,
+        topology_workflow::WindowServerLifecyclePayload {
+            window_server_id: overlay.id,
+            space,
+            kind: SpaceEventKind::User,
+        },
+        topology_workflow::WindowServerAppearedObservations {
+            resolved_space: Some(space),
+            active_spaces: [space].into_iter().collect(),
+            mission_control_active: false,
+            last_known_user_space: Some(space),
+            window_server_info: Some(overlay),
+            app_known: false,
+            running_app_info: Some(crate::sys::app::AppInfo {
+                bundle_id: Some("git.acsandmann.rift".into()),
+                localized_name: Some("rift".into()),
+            }),
+        },
+    )
+    .unwrap();
+    assert!(
+        outcome.wm_events.is_empty(),
+        "rift must not launch itself as an app"
+    );
+    assert!(outcome.window_server_updates.is_empty());
+    assert!(outcome.window_inventory_requests.is_empty());
+    assert!(!reactor.state.windows.is_window_server_observed(overlay.id));
+}

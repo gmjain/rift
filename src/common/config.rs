@@ -643,7 +643,75 @@ pub struct UiSettings {
     pub mission_control: MissionControlSettings,
     #[serde(default)]
     pub border: BorderSettings,
+    #[serde(default)]
+    pub dim: DimSettings,
 }
+
+/// Dim every window but the focused one: one translucent click-through
+/// overlay per display, ordered just below the focused window, with a hole
+/// around it.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DimSettings {
+    #[serde(default = "no")]
+    pub enabled: bool,
+    /// Overlay opacity, 0.0 to 1.0.
+    #[serde(default = "default_dim_opacity")]
+    pub opacity: f64,
+    #[serde(default = "default_dim_color")]
+    pub color: Color,
+    /// Fade in/out time on focus change, in milliseconds.
+    #[serde(default = "default_dim_fade_ms")]
+    pub fade_ms: f64,
+    /// What displays without the focused window do.
+    #[serde(default)]
+    pub other_displays: DimOtherDisplays,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DimOtherDisplays {
+    /// Dim everything there.
+    Dim,
+    /// Keep the hole around the window last focused on that display.
+    #[default]
+    KeepLastFocused,
+}
+
+impl Default for DimSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            opacity: default_dim_opacity(),
+            color: default_dim_color(),
+            fade_ms: default_dim_fade_ms(),
+            other_displays: DimOtherDisplays::default(),
+        }
+    }
+}
+
+impl DimSettings {
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if !(0.0..=1.0).contains(&self.opacity) {
+            issues.push(format!(
+                "ui.dim.opacity must be between 0.0 and 1.0, got {}",
+                self.opacity
+            ));
+        }
+        if self.fade_ms < 0.0 || self.fade_ms.is_nan() {
+            issues.push(format!(
+                "ui.dim.fade_ms must be non-negative, got {}",
+                self.fade_ms
+            ));
+        }
+        issues
+    }
+}
+
+fn default_dim_opacity() -> f64 { 0.15 }
+fn default_dim_color() -> Color { Color::new(0.0, 0.0, 0.0, 1.0) }
+fn default_dim_fade_ms() -> f64 { 150.0 }
 
 /// Window borders drawn by rift in the gaps around managed windows: one
 /// click-through overlay per display, ordered below every app window.
@@ -1524,6 +1592,7 @@ impl Settings {
         }
 
         issues.extend(self.ui.border.validate());
+        issues.extend(self.ui.dim.validate());
 
         issues
     }
@@ -2850,6 +2919,42 @@ mod tests {
         let mut config = Config::default();
         config.settings.ui.border.width = -1.0;
         assert!(config.validate().iter().any(|issue| issue.contains("ui.border.width")));
+    }
+
+    #[test]
+    fn dim_settings_default_off_and_parse() {
+        let defaults: DimSettings = toml::from_str("").unwrap();
+        assert_eq!(defaults, DimSettings::default());
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.opacity, 0.15);
+        assert_eq!(defaults.color, Color::new(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(defaults.fade_ms, 150.0);
+        assert_eq!(defaults.other_displays, DimOtherDisplays::KeepLastFocused);
+        assert_eq!(Config::default().settings.ui.dim, DimSettings::default());
+
+        let settings: DimSettings = toml::from_str(
+            r#"
+            enabled = true
+            opacity = 0.4
+            color = { r = 0.1, g = 0.1, b = 0.2 }
+            fade_ms = 0
+            other_displays = "dim"
+            "#,
+        )
+        .unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.opacity, 0.4);
+        assert_eq!(settings.color, Color::new(0.1, 0.1, 0.2, 1.0));
+        assert_eq!(settings.fade_ms, 0.0);
+        assert_eq!(settings.other_displays, DimOtherDisplays::Dim);
+        assert!(settings.validate().is_empty());
+        assert!(toml::from_str::<DimSettings>("other_displays = \"keep\"").is_err());
+
+        let invalid: DimSettings = toml::from_str("opacity = 1.5\nfade_ms = -1").unwrap();
+        let issues = invalid.validate();
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().any(|issue| issue.contains("ui.dim.opacity")));
+        assert!(issues.iter().any(|issue| issue.contains("ui.dim.fade_ms")));
     }
 
     #[test]

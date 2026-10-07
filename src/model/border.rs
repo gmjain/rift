@@ -52,6 +52,8 @@ pub enum FullscreenKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BorderWindow {
     pub id: WindowId,
+    /// The WindowServer id, when known; other overlays order against it.
+    pub server_id: Option<u32>,
     /// Target frame in global CG (top-left origin) coordinates.
     pub frame: CGRect,
     pub focused: bool,
@@ -245,6 +247,7 @@ mod tests {
     fn window(idx: u32, frame: CGRect) -> BorderWindow {
         BorderWindow {
             id: WindowId::new(1, idx),
+            server_id: None,
             frame,
             focused: false,
             floating: false,

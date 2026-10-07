@@ -1,5 +1,6 @@
 pub mod app_rules;
 pub mod border;
+pub mod dim;
 pub mod floating_position_store;
 pub mod hidden_window_placement;
 pub mod selection;

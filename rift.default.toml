@@ -294,6 +294,21 @@ radius = 12.0
 # toggle_fullscreen leaves no gap, so its stroke is drawn just inside the window, above it.
 # fullscreen = { color = { r = 1.0, g = 0.8, b = 0.0, a = 1.0 }, width = 2.0 }
 
+[settings.ui.dim]
+# dim every window but the focused one: one translucent click-through overlay per display,
+# ordered just below the focused window with a hole around it (defaults to off).
+# Off while the focused workspace has a toggle_fullscreen window and on native fullscreen Spaces.
+enabled = false
+# overlay opacity, 0.0 to 1.0
+opacity = 0.15
+# RGBA components range from 0.0 to 1.0
+# color = { r = 0.0, g = 0.0, b = 0.0, a = 1.0 }
+# fade in/out on focus change, in milliseconds
+fade_ms = 150
+# displays without the focused window: "keep_last_focused" leaves the hole around the window
+# focus last sat on there; "dim" dims everything there
+other_displays = "keep_last_focused"
+
 # Trackpad gestures
 [settings.gestures]
 # Enable horizontal swipes to switch virtual workspaces
