@@ -70,10 +70,6 @@ fn same_screen(a: &ScreenInfo, b: &ScreenInfo) -> bool {
 }
 
 impl Reactor {
-    pub(crate) fn has_workspace_display_bindings(&self) -> bool {
-        self.config.virtual_workspaces.has_display_bindings()
-    }
-
     /// Whether all displays share one set of workspaces.
     pub(crate) fn has_global_workspaces(&self) -> bool {
         self.config.virtual_workspaces.is_global()
@@ -209,13 +205,18 @@ impl Reactor {
         bound_screen(screens, binding)?.space
     }
 
-    /// The active native space of the display workspace `index` lives on: the
-    /// one it is bound to, or with global workspaces the one showing it or
-    /// holding its windows. `None` means the workspace is unowned: bound to a
-    /// disconnected display, or not existing yet.
+    /// The native space of the display workspace `index` lives on: the one it
+    /// is bound to if that display is connected, or with global workspaces the
+    /// one showing it or holding its windows. `None` means the workspace is
+    /// unowned: bound to a disconnected display, or not existing yet. A
+    /// display in native fullscreen keeps its workspaces, so the space may be
+    /// off screen for a while.
     pub(crate) fn owner_space_for_workspace_index(&self, index: usize) -> Option<SpaceId> {
-        self.owner_space_among(&self.space_state.screens, index)
-            .filter(|space| self.is_space_active(*space))
+        self.bound_space_for_workspace_index(index).or_else(|| {
+            self.has_global_workspaces()
+                .then(|| self.derived_owner_among(&self.space_state.screens, index))
+                .flatten()
+        })
     }
 
     /// `owner_space_for_workspace_index` among `screens`, which may be the
@@ -229,26 +230,63 @@ impl Reactor {
     }
 
     /// The display whose copy of workspace `index` is showing, else the one
-    /// whose copy holds the most windows. Ties go to the leftmost display.
+    /// whose copy holds windows. Where two displays qualify (a layout restored
+    /// from per-display workspaces, a display back from native fullscreen) the
+    /// copy with more windows wins, then the display the user is on, then the
+    /// leftmost.
     fn derived_owner_among(&self, screens: &[ScreenInfo], index: usize) -> Option<SpaceId> {
         let workspaces = self.layout_manager.layout_engine.workspaces();
-        let mut fullest: Option<(usize, SpaceId)> = None;
+        let here = self.space_state.command_space;
+        // (showing, windows, the user's display) per candidate, best first.
+        let mut best: Option<((bool, usize, bool), SpaceId)> = None;
         for screen in physical_order(screens) {
-            let Some(space) = screen.space else {
+            let Some(space) = self.workspace_space_of_screen(screen) else {
                 continue;
             };
             let Some(copy) = workspaces.workspace_ids(space).get(index).copied() else {
                 continue;
             };
-            if workspaces.active_workspace(space) == Some(copy) {
-                return Some(space);
-            }
+            let showing = workspaces.active_workspace(space) == Some(copy);
             let windows = self.state.windows.workspace_window_count(space, copy);
-            if windows > 0 && fullest.is_none_or(|(most, _)| windows > most) {
-                fullest = Some((windows, space));
+            if !showing && windows == 0 {
+                continue;
+            }
+            let rank = (showing, windows, here == Some(space));
+            if best.is_none_or(|(top, _)| rank > top) {
+                best = Some((rank, space));
             }
         }
-        fullest.map(|(_, space)| space)
+        best.map(|(_, space)| space)
+    }
+
+    /// The native space holding `screen`'s workspaces: the one it shows, or,
+    /// while it shows a native fullscreen Space, the user Space it will come
+    /// back to.
+    fn workspace_space_of_screen(&self, screen: &ScreenInfo) -> Option<SpaceId> {
+        if let Some(space) = screen.space {
+            return Some(space);
+        }
+        if !self.has_global_workspaces() {
+            return None;
+        }
+        let workspaces = self.layout_manager.layout_engine.workspaces();
+        let shown_elsewhere = |space: &SpaceId| {
+            self.space_state.screens.iter().any(|other| other.space == Some(*space))
+        };
+        self.space_state
+            .last_user_space_by_display
+            .get(&screen.display_uuid)
+            .copied()
+            .into_iter()
+            .chain(
+                self.space_state
+                    .display_space_ids
+                    .get(&screen.display_uuid)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+            .find(|space| !shown_elsewhere(space) && !workspaces.workspace_ids(*space).is_empty())
     }
 
     /// With global workspaces, remember which workspace has focus so that
@@ -451,6 +489,10 @@ impl Reactor {
         index: usize,
     ) -> anyhow::Result<EventOutcome> {
         let Some(screen) = self.space_state.screen_by_space(owner).cloned() else {
+            warn!(
+                index,
+                "workspace switch ignored: its display is not showing its workspaces"
+            );
             return Ok(EventOutcome::no_change());
         };
         let workspaces = self.layout_manager.layout_engine.workspaces_mut();
@@ -483,6 +525,10 @@ impl Reactor {
         follow: bool,
     ) -> anyhow::Result<EventOutcome> {
         let Some(screen) = self.space_state.screen_by_space(owner).cloned() else {
+            warn!(
+                index,
+                "window move ignored: the workspace's display is not showing its workspaces"
+            );
             return Ok(EventOutcome::no_change());
         };
         let Some(state) = self.state.windows.window(window).filter(|_| !self.is_in_drag()) else {
@@ -649,7 +695,7 @@ impl Reactor {
 
     /// Re-apply bindings once the current event's outcome has settled.
     pub(crate) fn check_display_bindings_later(&mut self) {
-        if self.has_workspace_display_bindings() {
+        if self.routes_workspace_commands() {
             self.bindings_need_check = true;
         }
     }
@@ -672,6 +718,7 @@ impl Reactor {
                 return;
             }
             self.bindings_need_check = false;
+            self.settle_global_workspaces();
             let mut outcome = EventOutcome::no_change();
             let normalized = self.normalize_bound_active_workspaces(&mut outcome);
             let rehomed = self.rehome_bound_windows(&mut outcome);
@@ -681,9 +728,13 @@ impl Reactor {
         }
     }
 
-    /// Switch displays showing a workspace bound to another connected display
+    /// Switch displays showing a workspace owned by another connected display
     /// back to their last own workspace, or the one they start on. When the owner
     /// shows nothing, it takes the workspace over so the user keeps seeing it.
+    ///
+    /// With global workspaces two displays showing the same workspace is what a
+    /// layout restored from per-display workspaces, or a display back from
+    /// native fullscreen, can leave behind; the display losing the tie yields.
     fn normalize_bound_active_workspaces(&mut self, outcome: &mut EventOutcome) -> bool {
         let mut changed = false;
         for screen in self.space_state.screens.clone() {
@@ -698,7 +749,7 @@ impl Reactor {
                 continue;
             };
             let Some(owner) =
-                self.bound_space_for_workspace_index(index).filter(|owner| *owner != space)
+                self.owner_space_for_workspace_index(index).filter(|owner| *owner != space)
             else {
                 continue;
             };
@@ -734,7 +785,8 @@ impl Reactor {
         changed
     }
 
-    /// Move windows sitting in a bound workspace on another display to its owner.
+    /// Move windows sitting in a workspace's copy on another display than its
+    /// owner to the owner's copy.
     fn rehome_bound_windows(&mut self, outcome: &mut EventOutcome) -> bool {
         let workspaces = self.layout_manager.layout_engine.workspaces();
         let moves: Vec<_> = self
@@ -755,7 +807,7 @@ impl Reactor {
             .filter_map(|(window, assignment)| {
                 let index = self.workspace_ordinal(assignment.space, assignment.workspace_id)?;
                 let owner = self
-                    .bound_space_for_workspace_index(index)
+                    .owner_space_for_workspace_index(index)
                     .filter(|owner| *owner != assignment.space)?;
                 Some((window, assignment.space, owner, index))
             })

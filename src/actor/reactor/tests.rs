@@ -9409,3 +9409,179 @@ fn global_workspaces_moving_a_workspace_leaves_the_target_its_workspace_with_win
         "ws1 keeps its window on the right display"
     );
 }
+
+/// A window of a fresh app with its frame on the right display.
+fn open_window_on_right(apps: &mut Apps, reactor: &mut Reactor, pid: pid_t) -> WindowId {
+    let mut on_right = make_window(1);
+    on_right.frame = CGRect::new(CGPoint::new(1200., 100.), CGSize::new(400., 400.));
+    apps.make_app_and_settle(reactor, pid, vec![on_right]);
+    WindowId::new(pid, 1)
+}
+
+#[test]
+fn global_workspaces_two_displays_showing_one_workspace_leaves_it_to_the_fuller_copy() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    let stray = open_window_on_right(&mut apps, &mut reactor, 2);
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    // As after restoring a layout saved with per-display workspaces: both
+    // displays show ws0, with two windows on the left and one on the right.
+    assert!(reactor.set_test_active_workspace(right_space, right_workspaces[0]));
+    assert!(reactor.assign_test_window_to_workspace(right_space, stray, right_workspaces[0]));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(0));
+
+    // The first full snapshot after the restore.
+    reactor.handle_event(space_state_event_with(
+        vec![left_screen(), right_screen()],
+        vec![Some(left_space), Some(right_space)],
+        |state| state.should_force_refresh_layout = true,
+    ));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(
+        active_workspace_index_of(&reactor, left_space),
+        Some(0),
+        "the copy with more windows keeps the workspace"
+    );
+    assert_eq!(
+        active_workspace_index_of(&reactor, right_space),
+        Some(1),
+        "the right display goes back to the workspace it showed before"
+    );
+    let left_workspaces = reactor.test_workspace_ids(left_space);
+    assert_eq!(reactor.assigned_space_for_window_id(stray), Some(left_space));
+    assert_eq!(
+        reactor.test_workspace_for_window(left_space, stray),
+        Some(left_workspaces[0]),
+        "the right display's window joins the workspace on its owner"
+    );
+}
+
+#[test]
+fn global_workspaces_move_stray_windows_to_the_display_owning_their_workspace() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    let left_workspaces = reactor.test_workspace_ids(left_space);
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    let stray = WindowId::new(1, 2);
+    // ws1 shows on the right display; a window turns up in the left's copy of
+    // it, as an app rule or an overview drop can arrange.
+    assert!(reactor.assign_test_window_to_workspace(left_space, stray, left_workspaces[1]));
+
+    // The next full snapshot (a display change here) repairs it.
+    reactor.handle_event(space_state_event_with(
+        vec![left_screen(), right_screen()],
+        vec![Some(left_space), Some(right_space)],
+        |state| state.should_force_refresh_layout = true,
+    ));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(reactor.assigned_space_for_window_id(stray), Some(right_space));
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, stray),
+        Some(right_workspaces[1])
+    );
+    let frame = reactor.state.windows.window(stray).unwrap().frame_monotonic;
+    assert!(frame.origin.x >= 1000., "{frame:?}");
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(
+        reactor.assigned_space_for_window_id(WindowId::new(1, 1)),
+        Some(left_space)
+    );
+}
+
+#[test]
+fn global_workspaces_stay_with_a_display_in_native_fullscreen() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    let on_right = open_window_on_right(&mut apps, &mut reactor, 2);
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, on_right),
+        Some(right_workspaces[1])
+    );
+    let fullscreen = |state: &mut ForwardedSpaceState| {
+        // The spaces actor reports a display showing a fullscreen Space with
+        // no space, and remembers the user Space it left.
+        state.display_space_ids.insert("test-display-1".into(), vec![right_space]);
+        state.last_user_space_by_display.insert("test-display-1".into(), right_space);
+    };
+    reactor.handle_event(space_state_event_with(
+        vec![left_screen(), right_screen()],
+        vec![Some(left_space), None],
+        fullscreen,
+    ));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(
+        active_workspace_index_of(&reactor, left_space),
+        Some(0),
+        "ws1 still lives on the right display"
+    );
+    reactor.handle_test_layout_command(LayoutCommand::NextWorkspace(None));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(2));
+    assert_eq!(reactor.assigned_space_for_window_id(on_right), Some(right_space));
+
+    // Back from fullscreen: nothing moved, nothing to repair.
+    reactor.handle_event(space_state_event_with(
+        vec![left_screen(), right_screen()],
+        vec![Some(left_space), Some(right_space)],
+        fullscreen,
+    ));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(2));
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, on_right),
+        Some(right_workspaces[1])
+    );
+}
+
+#[test]
+fn global_workspaces_app_rules_place_windows_on_the_display_owning_their_workspace() {
+    let mut settings = global_workspace_settings(4);
+    settings.app_rules = vec![crate::common::config::AppWorkspaceRule {
+        app_id: Some("com.testapp2".into()),
+        workspace: Some(WorkspaceSelector::Name("ws1".into())),
+        ..Default::default()
+    }];
+    let (mut apps, mut reactor, left_space, right_space) = two_display_global_reactor(settings);
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    let window = WindowId::new(2, 1);
+
+    // The window opens on the left display, where the user is; ws1 lives right.
+    make_active_app(&mut apps, &mut reactor, 2, make_windows(1), Some(window));
+
+    assert_eq!(reactor.assigned_space_for_window_id(window), Some(right_space));
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, window),
+        Some(right_workspaces[1])
+    );
+    let frame = reactor.state.windows.window(window).unwrap().frame_monotonic;
+    assert!(
+        frame.origin.x >= 1000.,
+        "window should sit on the right display: {frame:?}"
+    );
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+
+    // A rule for a workspace nobody owns keeps the window where it opened.
+    let mut settings = global_workspace_settings(4);
+    settings.app_rules = vec![crate::common::config::AppWorkspaceRule {
+        app_id: Some("com.testapp2".into()),
+        workspace: Some(WorkspaceSelector::Name("ws3".into())),
+        ..Default::default()
+    }];
+    let (mut apps, mut reactor, left_space, _right_space) = two_display_global_reactor(settings);
+    make_active_app(&mut apps, &mut reactor, 2, make_windows(1), Some(window));
+    let left_workspaces = reactor.test_workspace_ids(left_space);
+    assert_eq!(reactor.assigned_space_for_window_id(window), Some(left_space));
+    assert_eq!(
+        reactor.test_workspace_for_window(left_space, window),
+        Some(left_workspaces[3])
+    );
+}
