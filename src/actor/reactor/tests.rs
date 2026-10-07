@@ -9301,6 +9301,92 @@ fn global_workspaces_switch_to_a_workspace_parked_on_another_display_shows_it_th
     );
 }
 
+/// `two_display_global_reactor` whose layout engine reports what it broadcasts.
+fn two_display_global_reactor_with_broadcasts(
+    settings: crate::common::config::VirtualWorkspaceSettings,
+) -> (
+    Apps,
+    Reactor,
+    SpaceId,
+    SpaceId,
+    crate::model::broadcast::BroadcastReceiver,
+) {
+    let (broadcast_tx, broadcasts) = crate::actor::channel();
+    let layout = LayoutEngine::new(
+        &settings,
+        &crate::common::config::LayoutSettings::default(),
+        Some(broadcast_tx),
+    );
+    let mut reactor = bound_reactor_with_layout(layout, settings);
+    let (left_space, right_space) = (SpaceId::new(1), SpaceId::new(2));
+    connect_displays(&mut reactor, vec![left_screen(), right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]);
+    let mut apps = Apps::new();
+    apps.make_app_and_settle(&mut reactor, 1, make_windows(2));
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+    (apps, reactor, left_space, right_space, broadcasts)
+}
+
+/// The `workspace_changed` events broadcast since the last call: (space, name).
+fn workspace_changes(
+    broadcasts: &mut crate::model::broadcast::BroadcastReceiver,
+) -> Vec<(u64, String)> {
+    std::iter::from_fn(|| broadcasts.try_recv().ok())
+        .filter_map(|(_, event)| match event {
+            BroadcastEvent::WorkspaceChanged { space_id, workspace_name, .. } => {
+                Some((space_id, workspace_name))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn global_workspaces_switch_to_a_workspace_another_display_shows_reports_it_at_once() {
+    let (mut apps, mut reactor, _left_space, right_space, mut broadcasts) =
+        two_display_global_reactor_with_broadcasts(global_workspace_settings(4));
+    workspace_changes(&mut broadcasts);
+
+    // ws1 shows on the right display, so the switch only moves focus there.
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+
+    assert_eq!(
+        workspace_changes(&mut broadcasts),
+        vec![(right_space.get(), "ws1".to_string())],
+        "reported with the command, not after the focus raise and the space snapshot"
+    );
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+}
+
+#[test]
+fn focusing_a_display_reports_its_workspace_only_when_focus_moves() {
+    let (_apps, mut reactor, _left_space, right_space, mut broadcasts) =
+        two_display_global_reactor_with_broadcasts(global_workspace_settings(4));
+    workspace_changes(&mut broadcasts);
+
+    reactor.handle_event(focus_display_command(DisplaySelector::Uuid(
+        "test-display-0".into(),
+    )));
+    assert_eq!(
+        workspace_changes(&mut broadcasts),
+        vec![],
+        "the left display already has focus"
+    );
+
+    reactor.handle_event(focus_display_command(DisplaySelector::Uuid(
+        "test-display-1".into(),
+    )));
+    assert_eq!(workspace_changes(&mut broadcasts), vec![(
+        right_space.get(),
+        "ws1".to_string()
+    )]);
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+}
+
 #[test]
 fn global_workspaces_move_a_window_to_the_display_owning_the_workspace() {
     let (mut apps, mut reactor, left_space, right_space) =
