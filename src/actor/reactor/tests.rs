@@ -8919,3 +8919,23 @@ fn binding_work_waits_while_the_native_topology_is_invalidated() {
         "the authoritative snapshot that ends the instability runs the queued work"
     );
 }
+
+#[test]
+fn workspace_scope_changes_wait_for_a_restart() {
+    use crate::common::config::WorkspaceScope;
+    let mut reactor = test_reactor();
+    assert_eq!(
+        reactor.config.virtual_workspaces.scope,
+        WorkspaceScope::PerDisplay
+    );
+    let mut updated = reactor.config.clone();
+    updated.virtual_workspaces.scope = WorkspaceScope::Global;
+
+    reactor.handle_event(Event::ConfigUpdated(updated));
+
+    assert_eq!(
+        reactor.config.virtual_workspaces.scope,
+        WorkspaceScope::PerDisplay,
+        "the scope rift started with stays until a restart"
+    );
+}
