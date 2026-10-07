@@ -5733,6 +5733,7 @@ impl Reactor {
             .as_ref()
             .and_then(|screen| screen.space)
             .is_none_or(|space| self.is_space_active(space));
+        let focused_space = self.workspace_command_space();
         if target_is_active
             && let Some(screen) = screen.as_ref().filter(|screen| screen.space.is_some())
         {
@@ -5742,6 +5743,15 @@ impl Reactor {
             // Honor explicit display selection before the native notification arrives,
             // even on activation failure. Later spaces-actor updates remain authoritative.
             self.space_state.command_space = screen.space;
+            // Focus on another display means another focused workspace: report it now.
+            // The space snapshot that would report it waits for the focus raise and the
+            // native display change (~200 ms), and with global workspaces this is how a
+            // switch to the workspace another display shows ends.
+            if let Some(space) = screen.space
+                && focused_space != Some(space)
+            {
+                self.layout_manager.layout_engine.announce_active_workspace(space);
+            }
         }
         let focus_window_center = focus_window
             .and_then(|wid| self.state.windows.window(wid))

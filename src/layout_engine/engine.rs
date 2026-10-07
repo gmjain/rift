@@ -3659,6 +3659,12 @@ impl LayoutEngine {
         }
     }
 
+    /// Report the workspace `space` shows as a `workspace_changed`, for a change
+    /// of the focused display rather than of the workspace a display shows.
+    pub(crate) fn announce_active_workspace(&self, space: SpaceId) {
+        self.broadcast_workspace_changed(space);
+    }
+
     fn broadcast_workspace_changed(&self, space_id: SpaceId) {
         if let Some(ref broadcast_tx) = self.broadcast_tx {
             if let Some((active_workspace_id, active_workspace_name)) =
