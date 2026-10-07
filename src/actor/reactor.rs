@@ -5,6 +5,7 @@
 //! changes by sending requests out to the other actors in the system.
 
 mod animation;
+mod autosave;
 mod events;
 mod gesture;
 pub(crate) use crate::layout_engine::WorkspaceDropRequest as OverviewDrop;
@@ -101,6 +102,15 @@ use crate::sys::window_server::{
 };
 
 pub type Sender = actor::Sender<Event>;
+
+/// The layout file autosave writes: the one `--restore` reads. Tests never touch it.
+fn autosave_path() -> std::path::PathBuf {
+    if cfg!(test) {
+        std::env::temp_dir().join(format!("rift-test-autosave-{}.ron", std::process::id()))
+    } else {
+        crate::common::config::restore_file()
+    }
+}
 type Receiver = actor::Receiver<Event>;
 pub use query::ReactorQueryHandle;
 
@@ -205,6 +215,9 @@ pub enum SpaceEventKind {
 pub enum Event {
     #[serde(skip)]
     CameraFinished,
+    /// The autosave thread's wake-up: a layout save may be due.
+    #[serde(skip)]
+    AutosaveDue,
     #[serde(skip)]
     OverviewSelectWorkspace {
         display: String,
@@ -440,6 +453,7 @@ pub struct Reactor {
     /// Workspace display bindings need re-applying once the current event's
     /// outcome has settled window membership.
     bindings_need_check: bool,
+    autosave: autosave::Autosave,
     #[cfg(test)]
     event_outcome_phase_trace: Vec<&'static str>,
     #[cfg(test)]
@@ -481,6 +495,7 @@ impl Reactor {
         reactor.menu_manager.menu_tx = Some(menu_tx);
         reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
         reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
+        reactor.autosave.run_in_background(events_tx_clone.clone());
         let query_handle = ReactorQueryHandle::new(events_tx_clone.clone());
         thread::Builder::new()
             .name("reactor".to_string())
@@ -578,6 +593,7 @@ impl Reactor {
             presentations: HashMap::default(),
             in_flight_display_moves: HashMap::default(),
             bindings_need_check: false,
+            autosave: autosave::Autosave::new(&config.settings.persistence, autosave_path()),
             #[cfg(test)]
             event_outcome_phase_trace: Vec::new(),
             #[cfg(test)]
@@ -1033,6 +1049,10 @@ impl Reactor {
             }
             Event::CameraFinished => {
                 self.commit_presentations();
+                return;
+            }
+            Event::AutosaveDue => {
+                self.run_due_autosave(Instant::now());
                 return;
             }
             Event::Query(req) => {
@@ -2101,6 +2121,7 @@ impl Reactor {
                 return Ok(system_workflow::handle_raise_timeout(sequence_id)?);
             }
             Event::ConfigUpdated(mut new_cfg) => {
+                self.autosave.configure(&new_cfg.settings.persistence, Instant::now());
                 // The workspace scope decides how every display's workspaces relate;
                 // switching it live would need the two models merged. Keep the one
                 // rift started with until a restart.
@@ -2538,6 +2559,11 @@ impl Reactor {
     fn apply_event_outcome(&mut self, outcome: EventOutcome) {
         #[cfg(test)]
         self.event_outcome_phase_trace.push("model");
+        if outcome.arrange.passes > 0
+            || outcome.layout_responses.iter().any(|(response, _)| response.changed)
+        {
+            self.note_layout_change();
+        }
         if !outcome.window_server_updates.is_empty() {
             self.update_partial_window_server_info(outcome.window_server_updates);
         }
@@ -4118,6 +4144,10 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
+        // Focus alone is not worth a save; the next save records it.
+        if !matches!(event, LayoutEvent::WindowFocused(..)) {
+            self.note_layout_change();
+        }
         let focus_changed = matches!(
             &event,
             LayoutEvent::WindowFocused(_, window)

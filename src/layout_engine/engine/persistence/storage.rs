@@ -1,3 +1,7 @@
+use std::sync::LazyLock;
+
+use parking_lot::Mutex;
+
 use super::snapshot::{CURRENT_SCHEMA_VERSION, PersistedLayout};
 use super::*;
 
@@ -117,6 +121,11 @@ impl LayoutEngine {
     }
 
     pub fn save(&self, path: PathBuf) -> std::io::Result<()> {
+        write_layout_snapshot(&path, &self.snapshot()?).map(|_| ())
+    }
+
+    /// Validate and serialize the layout without writing it anywhere.
+    pub(crate) fn snapshot(&self) -> std::io::Result<LayoutSnapshot> {
         self.workspaces
             .validate_persisted_topology()
             .and_then(|_| self.workspaces.validate_layouts())
@@ -125,54 +134,10 @@ impl LayoutEngine {
         self.persistence
             .validate()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(Path::to_path_buf);
-        if let Some(parent) = &parent {
-            fs::create_dir_all(parent)?;
-        }
-        let serialized = self.serialize_to_string();
-        let (temporary, mut file) = loop {
-            let sequence = SAVE_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            let temporary_extension = path
-                .extension()
-                .map(|extension| {
-                    format!(
-                        "{}.{}.{}.tmp",
-                        extension.to_string_lossy(),
-                        std::process::id(),
-                        sequence
-                    )
-                })
-                .unwrap_or_else(|| format!("{}.{}.tmp", std::process::id(), sequence));
-            let temporary = path.with_extension(temporary_extension);
-            match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary) {
-                Ok(file) => break (temporary, file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        };
-        let result = (|| {
-            file.write_all(serialized.as_bytes())?;
-            // SaveAndExit terminates the process immediately after this returns. Flush the file
-            // itself before the atomic rename so a successful shutdown save means the complete
-            // snapshot has reached the filesystem, not merely userspace/kernel write buffers.
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &path)?;
-            // The rename is the commit point. Sync its directory as well so an immediate
-            // SaveAndExit cannot acknowledge a rename that is still only in filesystem metadata
-            // cache.
-            if let Some(parent) = &parent {
-                File::open(parent)?.sync_all()?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result
+        Ok(LayoutSnapshot {
+            generation: SNAPSHOT_GENERATION.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+            contents: self.serialize_to_string(),
+        })
     }
 
     /// Capture live fingerprint and floating-frame inputs, then atomically save one coherent
@@ -183,6 +148,20 @@ impl LayoutEngine {
         window_store: &WindowStore,
         active_space: Option<SpaceId>,
     ) -> std::io::Result<()> {
+        let snapshot = self.snapshot_current_layout(window_store, active_space)?;
+        write_layout_snapshot(&path, &snapshot).map(|_| ())
+    }
+
+    /// Bring the saved inputs up to date with the live windows. `prune` also removes state
+    /// that only makes the file ambiguous: tiled windows from other workspaces' trees and
+    /// their remembered floating frames. Those are also healed when a file is loaded, and the
+    /// remembered frame is where a window goes when it floats again, so autosave keeps them.
+    fn prepare_current_layout_for_save(
+        &mut self,
+        window_store: &WindowStore,
+        active_space: Option<SpaceId>,
+        prune: bool,
+    ) {
         self.refresh_window_fingerprints(window_store);
         // Never write an origin hint that has no corresponding saved layout. A stale native-space
         // observation is worse than no hint because it makes a portable file look unambiguous.
@@ -192,7 +171,9 @@ impl LayoutEngine {
         for (window, state) in window_store.iter_windows() {
             if self.floating.is_floating(window) {
                 // Floating and tiled are mutually exclusive persisted representations.
-                self.remove_window_from_all_tiling_trees(window);
+                if prune {
+                    self.remove_window_from_all_tiling_trees(window);
+                }
                 let Some(assignment) = window_store.workspace_info_for_window(window) else {
                     // An unassigned live window has no restorable location. Keep its fingerprint
                     // for lifecycle continuity, but never serialize a stale frame from an older
@@ -222,7 +203,7 @@ impl LayoutEngine {
                         state.frame_monotonic,
                     );
                 }
-            } else {
+            } else if prune {
                 // Floating frames are type-specific state. A tiled window retaining one creates a
                 // second persisted location and makes later reconciliation order-dependent.
                 self.floating_positions.remove_window(window);
@@ -236,7 +217,29 @@ impl LayoutEngine {
                 }
             }
         }
-        self.save(path)
+    }
+
+    /// What `save_current_layout` writes, serialized but not written: the caller can write it
+    /// with [`write_layout_snapshot`] on another thread.
+    pub fn snapshot_current_layout(
+        &mut self,
+        window_store: &WindowStore,
+        active_space: Option<SpaceId>,
+    ) -> std::io::Result<LayoutSnapshot> {
+        self.prepare_current_layout_for_save(window_store, active_space, true);
+        self.snapshot()
+    }
+
+    /// Like [`Self::snapshot_current_layout`], for a save taken while rift keeps running: it
+    /// leaves the running layout as it is apart from the saved window identities and the
+    /// current frames of floating windows on showing workspaces.
+    pub fn snapshot_layout_for_autosave(
+        &mut self,
+        window_store: &WindowStore,
+        active_space: Option<SpaceId>,
+    ) -> std::io::Result<LayoutSnapshot> {
+        self.prepare_current_layout_for_save(window_store, active_space, false);
+        self.snapshot()
     }
 
     /// Heal old snapshots that represent one window as both tiled and floating, or where a
@@ -351,6 +354,90 @@ impl LayoutEngine {
         self.app_rules = AppRuleEngine::new(&virtual_workspace_config.app_rules);
         self.workspaces.update_settings(virtual_workspace_config, layout_settings);
     }
+}
+
+/// A serialized layout, ready to be written to a layout file.
+///
+/// Snapshots are numbered as they are taken. [`write_layout_snapshot`] never lets an older one
+/// replace a newer one in the same file, so a background autosave that finishes late cannot
+/// undo an explicit save made after it.
+#[derive(Debug)]
+pub struct LayoutSnapshot {
+    generation: u64,
+    contents: String,
+}
+
+impl LayoutSnapshot {
+    pub fn contents(&self) -> &str { &self.contents }
+}
+
+static SNAPSHOT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The newest snapshot generation written to each layout file by this process. Held while a
+/// file is written, so writes of one file from different threads happen one at a time.
+static WRITTEN_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::default()));
+
+/// Atomically replace `path` with `snapshot` (temporary file, fsync, rename, fsync of the
+/// directory). Returns `Ok(false)` without writing when a newer snapshot is already there.
+pub fn write_layout_snapshot(path: &Path, snapshot: &LayoutSnapshot) -> std::io::Result<bool> {
+    let mut written = WRITTEN_GENERATIONS.lock();
+    if written.get(path).is_some_and(|newest| *newest > snapshot.generation) {
+        return Ok(false);
+    }
+    write_atomically(path, snapshot.contents.as_bytes())?;
+    written.insert(path.to_path_buf(), snapshot.generation);
+    Ok(true)
+}
+
+fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf);
+    if let Some(parent) = &parent {
+        fs::create_dir_all(parent)?;
+    }
+    let (temporary, mut file) = loop {
+        let sequence = SAVE_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let temporary_extension = path
+            .extension()
+            .map(|extension| {
+                format!(
+                    "{}.{}.{}.tmp",
+                    extension.to_string_lossy(),
+                    std::process::id(),
+                    sequence
+                )
+            })
+            .unwrap_or_else(|| format!("{}.{}.tmp", std::process::id(), sequence));
+        let temporary = path.with_extension(temporary_extension);
+        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        file.write_all(contents)?;
+        // SaveAndExit terminates the process immediately after this returns. Flush the file
+        // itself before the atomic rename so a successful shutdown save means the complete
+        // snapshot has reached the filesystem, not merely userspace/kernel write buffers.
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        // The rename is the commit point. Sync its directory as well so an immediate
+        // SaveAndExit cannot acknowledge a rename that is still only in filesystem metadata
+        // cache.
+        if let Some(parent) = &parent {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 pub(super) fn migrate_legacy_layout_system_tags(input: &str) -> Option<String> {

@@ -26,7 +26,10 @@ use crate::sys::screen::SpaceId;
 mod persistence;
 
 use persistence::PersistenceState;
-pub use persistence::{RestoreReport, RestoreRequest, RestoreScope, RestoreSource, RestoreWarning};
+pub use persistence::{
+    LayoutSnapshot, RestoreReport, RestoreRequest, RestoreScope, RestoreSource, RestoreWarning,
+    write_layout_snapshot,
+};
 pub use rift_protocol::LayoutCommand;
 
 const SMART_FLOATING_WIDTH_RATIO: f64 = 0.8;

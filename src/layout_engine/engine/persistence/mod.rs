@@ -251,5 +251,7 @@ mod restore;
 mod snapshot;
 mod storage;
 
+pub use storage::{LayoutSnapshot, write_layout_snapshot};
+
 #[cfg(test)]
 mod tests;
