@@ -57,6 +57,14 @@ const CORNER_RADIUS: f64 = 3.0;
 const BORDER_WIDTH: f64 = 1.0;
 const CONTENT_INSET: f64 = 2.0;
 const FONT_SIZE: f64 = 11.0;
+// AeroSpace frames a workspace showing a fullscreen window with a dashed border:
+// 4px of padding, a 2px line and a [10, 5] dash with phase 3 around its 40px
+// (2x) item. At the menu bar's point scale that is 2pt of padding and a 1pt
+// line; the dash shrinks with rift's 15-16pt cells.
+const FULLSCREEN_PADDING: f64 = 2.0;
+const FULLSCREEN_BORDER_WIDTH: f64 = 1.0;
+const FULLSCREEN_DASH: [CGFloat; 2] = [4.0, 2.0];
+const FULLSCREEN_DASH_PHASE: f64 = 1.0;
 
 #[cfg(test)]
 thread_local! {
@@ -377,6 +385,8 @@ struct WorkspaceRenderData {
     fill_alpha: f64,
     windows: Vec<CGRect>,
     label_line: Option<CachedTextLine>,
+    /// Outer bounds of the dashed frame around a workspace with a fullscreen window.
+    fullscreen_frame: Option<CGRect>,
 }
 
 struct WorkspaceRenderInput<'a> {
@@ -432,6 +442,7 @@ struct WorkspaceRenderKey {
     label: String,
     show_windows: bool,
     is_active: bool,
+    has_fullscreen: bool,
     window_count: usize,
     window_frames: Vec<[u64; 4]>,
 }
@@ -447,6 +458,7 @@ impl MenuIconRenderKey {
                 label: input.label.to_string(),
                 show_windows: input.show_windows,
                 is_active: input.workspace.is_active,
+                has_fullscreen: input.workspace.has_fullscreen,
                 window_count: input
                     .show_windows
                     .then_some(input.workspace.window_count)
@@ -484,6 +496,7 @@ impl MenuIconRenderKey {
                     && key.label == input.label
                     && key.show_windows == input.show_windows
                     && key.is_active == input.workspace.is_active
+                    && key.has_fullscreen == input.workspace.has_fullscreen
                     && (!input.show_windows || key.window_count == input.workspace.window_count)
                     && (!input.show_windows
                         || (key.window_frames.len() == input.workspace.windows.len()
@@ -1266,6 +1279,7 @@ define_class!(
 #[cfg(test)]
 mod layout_library_tests {
     use super::*;
+    use crate::sys::geometry::CGRectExt;
 
     fn workspace(
         id: &str,
@@ -1547,6 +1561,120 @@ mod layout_library_tests {
     }
 
     #[test]
+    fn render_key_tracks_fullscreen_in_both_display_styles() {
+        let base = displays();
+        for display_style in [WorkspaceDisplayStyle::Label, WorkspaceDisplayStyle::Layout] {
+            let settings = MenuBarSettings {
+                display_style,
+                show_empty: true,
+                ..Default::default()
+            };
+            let key = MenuIconRenderKey::from_inputs(&render_inputs(&base, &settings));
+            let mut changed = base.clone();
+            changed[1].workspaces[1].has_fullscreen = true;
+            assert!(!key.matches_inputs(&render_inputs(&changed, &settings)));
+            let key = MenuIconRenderKey::from_inputs(&render_inputs(&changed, &settings));
+            assert!(key.matches_inputs(&render_inputs(&changed, &settings)));
+            assert!(!key.matches_inputs(&render_inputs(&base, &settings)));
+        }
+    }
+
+    fn window(id: u32, x: f64, width: f64) -> crate::model::server::RuntimeWindowData {
+        serde_json::from_value(serde_json::json!({
+            "id": {"pid": 1, "idx": id}, "title": "", "frame": {
+                "origin": {"x": x, "y": 0.0}, "size": {"width": width, "height": 1000.0}
+            }, "is_floating": false, "is_focused": false, "window_server_id": id
+        }))
+        .unwrap()
+    }
+
+    fn outset(rect: CGRect, by: f64) -> CGRect {
+        CGRect::new(
+            CGPoint::new(rect.origin.x - by, rect.origin.y - by),
+            CGSize::new(rect.size.width + 2.0 * by, rect.size.height + 2.0 * by),
+        )
+    }
+
+    #[test]
+    fn fullscreen_workspace_is_framed_without_moving_its_neighbours_off_center() {
+        let attrs = build_text_attrs(&NSFont::systemFontOfSize_weight(FONT_SIZE, unsafe {
+            NSFontWeightMedium
+        }));
+        for display_style in [WorkspaceDisplayStyle::Label, WorkspaceDisplayStyle::Layout] {
+            let settings = MenuBarSettings {
+                display_style,
+                show_empty: true,
+                ..Default::default()
+            };
+            let mut plain = displays();
+            for (display, workspace) in [(0, 1), (1, 0)] {
+                let workspace = &mut plain[display].workspaces[workspace];
+                workspace.windows = vec![window(1, 0.0, 600.0), window(2, 600.0, 400.0)];
+                workspace.window_count = 2;
+            }
+            let mut framed = plain.clone();
+            // An inactive and an active (filled) workspace, on different displays.
+            framed[0].workspaces[1].has_fullscreen = true;
+            framed[1].workspaces[0].has_fullscreen = true;
+            let before = build_layout(&render_inputs(&plain, &settings), &attrs);
+            let after = build_layout(&render_inputs(&framed, &settings), &attrs);
+            assert!(before.workspaces.iter().all(|cell| cell.fullscreen_frame.is_none()));
+
+            assert_eq!(after.size.width, before.size.width + 4.0 * FULLSCREEN_PADDING);
+            assert_eq!(after.size.height, before.size.height + 2.0 * FULLSCREEN_PADDING);
+            let bounds = CGRect::new(CGPoint::new(0.0, 0.0), after.size);
+            for (index, (cell, plain_cell)) in
+                after.workspaces.iter().zip(&before.workspaces).enumerate()
+            {
+                assert_eq!(cell.bg_rect.size, plain_cell.bg_rect.size, "cell {index}");
+                assert_eq!(cell.bg_rect.mid().y, after.size.height / 2.0, "cell {index}");
+                assert_eq!(cell.fill_alpha, plain_cell.fill_alpha, "cell {index}");
+                let Some(frame) = cell.fullscreen_frame else {
+                    assert!(![1, 2].contains(&index), "cell {index} must be framed");
+                    continue;
+                };
+                assert!([1, 2].contains(&index), "cell {index} must not be framed");
+                // The frame surrounds the cell with padding on every side and
+                // stays inside the view, so its dashes are never clipped.
+                let cell_box = if display_style == WorkspaceDisplayStyle::Layout {
+                    outset(cell.bg_rect, BORDER_WIDTH / 2.0)
+                } else {
+                    cell.bg_rect
+                };
+                assert_eq!(frame, outset(cell_box, FULLSCREEN_PADDING));
+                assert_eq!(frame.origin.y, 0.0);
+                assert_eq!(frame.max().y, after.size.height);
+                assert!(frame.contains_rect(cell.bg_rect));
+                assert!(bounds.contains_rect(frame));
+                // Window previews move with their cell.
+                let shift = (
+                    cell.bg_rect.origin.x - plain_cell.bg_rect.origin.x,
+                    cell.bg_rect.origin.y - plain_cell.bg_rect.origin.y,
+                );
+                let previews = if display_style == WorkspaceDisplayStyle::Layout {
+                    2
+                } else {
+                    0
+                };
+                assert_eq!(cell.windows.len(), previews);
+                assert_eq!(plain_cell.windows.len(), previews);
+                for (window, plain_window) in cell.windows.iter().zip(&plain_cell.windows) {
+                    assert!(cell.bg_rect.contains_rect(*window));
+                    assert_eq!(window.size, plain_window.size);
+                    assert_eq!(window.origin.x - plain_window.origin.x, shift.0);
+                    assert_eq!(window.origin.y - plain_window.origin.y, shift.1);
+                }
+            }
+            // Neighbours keep their spacing outside the frame.
+            for pair in after.workspaces.windows(2) {
+                let left = pair[0].fullscreen_frame.unwrap_or(pair[0].bg_rect);
+                let right = pair[1].fullscreen_frame.unwrap_or(pair[1].bg_rect);
+                assert!(left.max().x < right.origin.x);
+            }
+        }
+    }
+
+    #[test]
     fn render_key_only_matches_visually_identical_inputs() {
         let mut workspace = workspace("one", 0, "main", true, "bsp");
         let key = MenuIconRenderKey::from_inputs(&[WorkspaceRenderInput {
@@ -1657,6 +1785,12 @@ fn build_layout(
     } else {
         CELL_HEIGHT
     };
+    // A framed workspace grows the strip; every cell stays vertically centered.
+    let frame_inset_y = if inputs.iter().any(|input| input.workspace.has_fullscreen) {
+        FULLSCREEN_PADDING
+    } else {
+        0.0
+    };
     let mut width = 0.0;
     let mut previous_display = None;
     let mut separators = Vec::new();
@@ -1689,12 +1823,25 @@ fn build_layout(
         } else {
             label_cell_width(label_line.as_ref().map_or(0.0, |line| line.width))
         };
-        let bg_rect = if input.show_windows {
+        let frame_padding = if workspace.has_fullscreen {
+            FULLSCREEN_PADDING
+        } else {
+            0.0
+        };
+        width += frame_padding;
+        let mut bg_rect = if input.show_windows {
             workspace_cell_rect(width, cell_width, height)
         } else {
             CGRect::new(CGPoint::new(width, 0.0), CGSize::new(cell_width, height))
         };
-        width += cell_width;
+        bg_rect.origin.y += frame_inset_y;
+        let fullscreen_frame = workspace.has_fullscreen.then(|| {
+            CGRect::new(
+                CGPoint::new(width - frame_padding, frame_inset_y - frame_padding),
+                CGSize::new(cell_width + 2.0 * frame_padding, height + 2.0 * frame_padding),
+            )
+        });
+        width += cell_width + frame_padding;
 
         let fill_alpha = if input.show_windows {
             if workspace.is_active {
@@ -1739,6 +1886,7 @@ fn build_layout(
             fill_alpha,
             windows,
             label_line,
+            fullscreen_frame,
         });
     }
 
@@ -1746,7 +1894,7 @@ fn build_layout(
         workspaces,
         separators,
         separator_line,
-        size: CGSize::new(width, height),
+        size: CGSize::new(width, height + 2.0 * frame_inset_y),
     }
 }
 
@@ -1895,6 +2043,32 @@ define_class!(
                         CGContext::set_text_position(Some(cg), text_x as CGFloat, baseline_y as CGFloat);
                         let line_ref: &CTLine = label_line.line.as_ref();
                         unsafe { line_ref.draw(cg) };
+                        CGContext::restore_g_state(Some(cg));
+                    }
+
+                    // Dashed like AeroSpace's strokeBorder: inside the frame, in the cell's
+                    // stroke color, with corners concentric to the cell's.
+                    if let Some(frame) = workspace.fullscreen_frame {
+                        let inset = FULLSCREEN_BORDER_WIDTH / 2.0;
+                        CGContext::save_g_state(Some(cg));
+                        CGContext::set_line_width(Some(cg), FULLSCREEN_BORDER_WIDTH);
+                        unsafe {
+                            CGContext::set_line_dash(
+                                Some(cg),
+                                FULLSCREEN_DASH_PHASE,
+                                FULLSCREEN_DASH.as_ptr(),
+                                FULLSCREEN_DASH.len(),
+                            );
+                        }
+                        add_rounded_rect(
+                            cg,
+                            frame.origin.x + inset,
+                            frame.origin.y + y_offset + inset,
+                            frame.size.width - 2.0 * inset,
+                            frame.size.height - 2.0 * inset,
+                            corner_radius + FULLSCREEN_PADDING - inset,
+                        );
+                        CGContext::stroke_path(Some(cg));
                         CGContext::restore_g_state(Some(cg));
                     }
                     if is_label { CGContext::end_transparency_layer(Some(cg)); }
