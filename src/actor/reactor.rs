@@ -1216,6 +1216,10 @@ impl Reactor {
 
     fn handle_event_inner(&mut self, event: Event) {
         let may_make_ready = matches!(&event, Event::SpaceStateChanged(_));
+        if matches!(&event, Event::WindowServerFocusChanged(..)) {
+            // A focus or raise WindowServer saw: the dim overlay re-orders under it.
+            self.borders.request_reorder();
+        }
         let previously_focused_window = self.main_window();
         match self.dispatch_workflow(event) {
             Ok(mut outcome) => {

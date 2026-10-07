@@ -253,6 +253,14 @@ pub fn handle_window_server_appeared(
     // TODO: figure out why this is happening, we should really know about this app,
     // why dont we get notifications that its being launched?
     if let Some(window_server_info) = window_server_info {
+        // Rift's own overlays are not application windows. The dim overlay is a display-sized
+        // window at the normal level; taken for an app window it would make rift observe
+        // itself as an app.
+        if window_server_info.pid == std::process::id() as crate::sys::app::pid_t {
+            state.windows.clear_window_server_observed(wsid);
+            trace!(?wsid, "Ignoring rift's own window");
+            return Ok(outcome);
+        }
         if window_server_info.layer != 0 {
             state.windows.clear_window_server_observed(wsid);
             trace!(

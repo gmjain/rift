@@ -10,9 +10,11 @@ use objc2_core_foundation::CGRect;
 use tracing::{debug, instrument, warn};
 
 use crate::actor;
+use crate::actor::app::WindowId;
 use crate::common::collections::HashMap;
 use crate::common::config::Config;
 use crate::model::border::{self, BorderAnimation, BorderWindow};
+use crate::model::dim;
 use crate::sys::screen::SpaceId;
 use crate::ui::border::DisplayOverlay;
 
@@ -27,8 +29,12 @@ pub struct DisplaySnapshot {
     pub backing_scale: f64,
     /// Windows of the active workspace, sorted by id.
     pub windows: Vec<BorderWindow>,
+    /// The window focus last sat on on this display (for dimming).
+    pub last_focused: Option<WindowId>,
     /// How the windows move to these frames; `None` when they jump.
     pub animation: Option<BorderAnimation>,
+    /// A focus/raise event: the dim overlay re-orders under the focused window.
+    pub reorder: bool,
 }
 
 #[derive(Debug)]
@@ -73,17 +79,19 @@ impl Border {
         }
     }
 
-    fn is_enabled(&self) -> bool { self.config.settings.ui.border.enabled }
+    fn is_enabled(&self) -> bool {
+        self.config.settings.ui.border.enabled || self.config.settings.ui.dim.enabled
+    }
 
     #[instrument(name = "border::handle_event", skip(self, event))]
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::DisplayUpdated(snapshot) => {
                 let uuid = snapshot.display_uuid.clone();
-                let animation = snapshot.animation;
+                let (animation, reorder) = (snapshot.animation, snapshot.reorder);
                 self.snapshots.insert(uuid.clone(), snapshot);
                 if self.is_enabled() {
-                    self.render(&uuid, animation);
+                    self.render(&uuid, animation, reorder);
                 }
             }
             Event::DisplayCleared(uuid) => {
@@ -104,16 +112,32 @@ impl Border {
         }
         let uuids: Vec<String> = self.snapshots.keys().cloned().collect();
         for uuid in uuids {
-            self.render(&uuid, None);
+            self.render(&uuid, None, true);
         }
     }
 
-    fn render(&mut self, uuid: &str, animation: Option<BorderAnimation>) {
+    fn render(&mut self, uuid: &str, animation: Option<BorderAnimation>, reorder: bool) {
         let Some(snapshot) = self.snapshots.get(uuid) else {
             return;
         };
-        let settings = &self.config.settings.ui.border;
-        let borders = border::compute(snapshot.frame, &snapshot.windows, settings);
+        let ui = &self.config.settings.ui;
+        let borders = ui
+            .border
+            .enabled
+            .then(|| border::compute(snapshot.frame, &snapshot.windows, &ui.border));
+        let focused = snapshot.windows.iter().find(|window| window.focused).map(|window| window.id);
+        let dim = dim::compute(
+            snapshot.frame,
+            &snapshot.windows,
+            focused,
+            snapshot.last_focused,
+            if ui.border.enabled {
+                ui.border.width
+            } else {
+                0.0
+            },
+            &ui.dim,
+        );
 
         let reusable = self.overlays.get(uuid).is_some_and(|overlay| {
             overlay.matches(snapshot.space, snapshot.frame, snapshot.backing_scale)
@@ -135,8 +159,13 @@ impl Border {
         let Some(overlay) = self.overlays.get_mut(uuid) else {
             return;
         };
-        if let Err(error) = overlay.apply(&borders, animation) {
+        if let Err(error) = overlay.apply_borders(borders.as_ref(), animation) {
             warn!(?error, uuid, "failed to update window border overlay");
+            self.overlays.remove(uuid);
+            return;
+        }
+        if let Err(error) = overlay.apply_dim(dim, &ui.dim, reorder) {
+            warn!(?error, uuid, "failed to update dim overlay");
             self.overlays.remove(uuid);
         }
     }

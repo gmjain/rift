@@ -5,7 +5,12 @@
 //! frames, focus, floating and fullscreen state) and sends the border actor the
 //! displays whose description changed. Comparing against the last description
 //! sent is what keeps focus changes to one message per affected display and
-//! no-op snapshots silent.
+//! no-op snapshots silent. The dim overlay rides on the same description; a
+//! WindowServer focus/raise event additionally resends the focused window's
+//! display once so the dim overlay can re-order under it.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use super::Reactor;
 use crate::actor::app::WindowId;
@@ -15,17 +20,36 @@ use crate::layout_engine::{FloatingFullscreenKind, LayoutSystem};
 use crate::model::border::{BorderAnimation, BorderWindow, FullscreenKind};
 use crate::sys::screen::SpaceId;
 
+/// A focus report that changes nothing resends a display (to re-order its dim overlay) at most
+/// this many times per [`FORCED_REORDER_WINDOW`]. Re-ordering touches only our own overlay
+/// window; should WindowServer ever answer it with another focus report, this keeps the echo
+/// to a few calls a second instead of a loop.
+pub(super) const MAX_FORCED_REORDERS: usize = 4;
+pub(super) const FORCED_REORDER_WINDOW: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 pub(super) struct BorderPublisher {
     /// What each display was last told, without the animation.
     last: HashMap<String, DisplaySnapshot>,
     /// Animations started by this event's layout passes, per space.
     motion: HashMap<SpaceId, BorderAnimation>,
+    /// The window focus last sat on, per space, for `other_displays`.
+    last_focused: HashMap<SpaceId, WindowId>,
+    /// A focus/raise event asked for the focused display to be resent.
+    reorder: bool,
+    /// When each display was recently resent only to re-order (nothing else changed).
+    pub(super) forced_at: HashMap<String, VecDeque<Instant>>,
 }
 
 impl BorderPublisher {
     /// Forget what was sent, so the next publish resends every display.
-    pub(super) fn reset(&mut self) { self.last.clear(); }
+    pub(super) fn reset(&mut self) {
+        self.last.clear();
+        self.forced_at.clear();
+    }
+
+    /// The next publish resends the focused window's display even if unchanged.
+    pub(super) fn request_reorder(&mut self) { self.reorder = true; }
 
     /// Record how a layout pass on `space` moves its windows.
     pub(super) fn note_motion(&mut self, space: SpaceId, motion: Option<BorderAnimation>) {
@@ -43,7 +67,9 @@ impl BorderPublisher {
 impl Reactor {
     /// Send the border actor every display whose strokes may have changed.
     pub(super) fn publish_borders(&mut self) {
-        if !self.config.settings.ui.border.enabled {
+        let ui = &self.config.settings.ui;
+        if !ui.border.enabled && !ui.dim.enabled {
+            self.borders.reorder = false;
             return;
         }
         let Some(tx) = self.communication_manager.border_tx.clone() else {
@@ -51,13 +77,31 @@ impl Reactor {
         };
         let mut present: HashSet<String> = HashSet::default();
         let motion = std::mem::take(&mut self.borders.motion);
+        let reorder = std::mem::take(&mut self.borders.reorder) && ui.dim.enabled;
+        let now = Instant::now();
         for mut snapshot in self.border_snapshots() {
             present.insert(snapshot.display_uuid.clone());
-            if self.borders.last.get(&snapshot.display_uuid) == Some(&snapshot) {
-                continue;
+            if let Some(focused) = snapshot.windows.iter().find(|window| window.focused) {
+                self.borders.last_focused.insert(snapshot.space, focused.id);
+            }
+            snapshot.last_focused = self.borders.last_focused.get(&snapshot.space).copied();
+            let focused_here = snapshot.windows.iter().any(|window| window.focused);
+            let unchanged = self.borders.last.get(&snapshot.display_uuid) == Some(&snapshot);
+            if unchanged {
+                if !(reorder && focused_here) {
+                    continue;
+                }
+                let recent =
+                    self.borders.forced_at.entry(snapshot.display_uuid.clone()).or_default();
+                recent.retain(|at| now.saturating_duration_since(*at) < FORCED_REORDER_WINDOW);
+                if recent.len() >= MAX_FORCED_REORDERS {
+                    continue;
+                }
+                recent.push_back(now);
             }
             self.borders.last.insert(snapshot.display_uuid.clone(), snapshot.clone());
             snapshot.animation = motion.get(&snapshot.space).copied();
+            snapshot.reorder = reorder && focused_here;
             tx.send(border::Event::DisplayUpdated(snapshot));
         }
         let gone: Vec<String> = self
@@ -69,6 +113,7 @@ impl Reactor {
             .collect();
         for uuid in gone {
             self.borders.last.remove(&uuid);
+            self.borders.forced_at.remove(&uuid);
             tx.send(border::Event::DisplayCleared(uuid));
         }
     }
@@ -118,6 +163,7 @@ impl Reactor {
                         && (floating || visible_tiled.contains(&wid));
                     Some(BorderWindow {
                         id: wid,
+                        server_id: window.info.sys_id.map(|wsid| wsid.as_u32()),
                         frame,
                         focused: focused == Some(wid),
                         floating,
@@ -136,7 +182,9 @@ impl Reactor {
                 frame: screen.frame,
                 backing_scale: screen.backing_scale,
                 windows,
+                last_focused: None,
                 animation: None,
+                reorder: false,
             });
         }
         snapshots

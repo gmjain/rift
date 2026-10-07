@@ -28,13 +28,15 @@ use objc2_quartz_core::{
 
 use crate::actor::app::WindowId;
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::Color;
+use crate::common::config::{Color, DimSettings};
 use crate::model::border::{BorderAnimation, DisplayBorders, Ring};
+use crate::model::dim::DimPlan;
 use crate::sys::cgs_window::{CgsWindow, CgsWindowError};
 use crate::sys::screen::SpaceId;
 use crate::sys::skylight::SLSWindowTags;
 use crate::sys::window_surface::WindowSurface;
 use crate::ui::common::with_disabled_actions;
+use crate::ui::dim::DimOverlay;
 
 /// Just above the desktop picture and its icons: below every app window by
 /// level alone, so the overlay is never reordered (per-window ordering is what
@@ -47,20 +49,46 @@ pub struct DisplayOverlay {
     space: SpaceId,
     frame: CGRect,
     scale: f64,
-    below: Overlay,
+    below: Option<Overlay>,
     inline: Option<Overlay>,
+    dim: Option<DimOverlay>,
 }
 
 impl DisplayOverlay {
+    /// Creates no WindowServer window yet; each overlay appears on first use.
     pub fn new(space: SpaceId, frame: CGRect, scale: f64) -> Result<Self, CgsWindowError> {
-        let below = Overlay::new(frame, scale, BELOW_LEVEL)?;
         Ok(Self {
             space,
             frame,
             scale,
-            below,
+            below: None,
             inline: None,
+            dim: None,
         })
+    }
+
+    /// Dim everything but the kept window per `plan`; `None` with dimming off
+    /// releases the overlay, with dimming on fades it out.
+    pub fn apply_dim(
+        &mut self,
+        plan: Option<DimPlan>,
+        settings: &DimSettings,
+        reorder: bool,
+    ) -> Result<(), CgsWindowError> {
+        if !settings.enabled {
+            self.dim = None;
+            return Ok(());
+        }
+        if self.dim.is_none() {
+            if plan.is_none() {
+                return Ok(());
+            }
+            self.dim = Some(DimOverlay::new(self.frame, self.scale)?);
+        }
+        if let Some(dim) = &mut self.dim {
+            dim.apply(plan, settings, reorder)?;
+        }
+        Ok(())
     }
 
     /// Whether this overlay can keep serving the display as described.
@@ -71,18 +99,29 @@ impl DisplayOverlay {
     /// Replace the strokes: one transaction for the below overlay, and the
     /// inline overlay created or dropped as the fullscreen exception comes and
     /// goes. With `animation`, strokes that move do so over that motion.
-    pub fn apply(
+    /// `None` (borders off) releases both overlays.
+    pub fn apply_borders(
         &mut self,
-        borders: &DisplayBorders,
+        borders: Option<&DisplayBorders>,
         animation: Option<BorderAnimation>,
     ) -> Result<(), CgsWindowError> {
-        self.below.apply(
-            borders
-                .below
-                .iter()
-                .map(|stroke| (stroke.id, stroke.outside_ring(), stroke.color)),
-            animation,
-        );
+        let Some(borders) = borders else {
+            self.below = None;
+            self.inline = None;
+            return Ok(());
+        };
+        if self.below.is_none() {
+            self.below = Some(Overlay::new(self.frame, self.scale, BELOW_LEVEL)?);
+        }
+        if let Some(below) = &mut self.below {
+            below.apply(
+                borders
+                    .below
+                    .iter()
+                    .map(|stroke| (stroke.id, stroke.outside_ring(), stroke.color)),
+                animation,
+            );
+        }
         match &borders.inline {
             Some(stroke) => {
                 if self.inline.is_none() {
