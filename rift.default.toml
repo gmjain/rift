@@ -52,6 +52,14 @@ new_window_display = "default"
 #   "com.raycast.macos", "com.apple.Spotlight"
 auto_focus_blacklist = []
 
+# Floating windows above tiled ones (i3 semantics)
+# - floating_windows_on_top: when a tiled window gains focus, the visible floating
+#   windows of its workspace (and the focused app's dialogs) are raised back above
+#   it, least recently used first, without activating their apps. Floating windows
+#   and dialogs then never get lost behind tiled windows. Off = plain macOS
+#   stacking (the focused window ends up on top).
+floating_windows_on_top = false
+
 # Run commands on start
 #
 # Tip: You can subscribe to rift events and trigger your own scripts. The command will
