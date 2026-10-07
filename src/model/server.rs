@@ -26,6 +26,8 @@ pub struct RuntimeWorkspaceData {
     pub windows: Vec<RuntimeWindowData>,
     /// The display the workspace lives on; see `rift_protocol::WorkspaceData`.
     pub display_uuid: Option<String>,
+    /// A window in the workspace is in Rift's fullscreen; see `rift_protocol::WorkspaceData`.
+    pub has_fullscreen: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +103,7 @@ impl From<RuntimeWorkspaceData> for protocol::WorkspaceData {
             is_active: value.is_active,
             window_count: value.window_count,
             display_uuid: value.display_uuid,
+            has_fullscreen: value.has_fullscreen,
             windows: value.windows.into_iter().map(Into::into).collect(),
         }
     }

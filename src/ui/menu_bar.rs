@@ -1285,6 +1285,7 @@ mod layout_library_tests {
             window_count: 0,
             windows: Vec::new(),
             display_uuid: None,
+            has_fullscreen: false,
         }
     }
 

@@ -2133,6 +2133,7 @@ mod tests {
             window_count: windows.len(),
             windows,
             display_uuid: None,
+            has_fullscreen: false,
         }
     }
     fn request(id: u32) -> PreviewRequest {

@@ -381,6 +381,7 @@ mod tests {
             window_count: 1,
             windows: Vec::new(),
             display_uuid: None,
+            has_fullscreen: false,
         }
     }
 
