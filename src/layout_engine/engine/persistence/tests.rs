@@ -267,6 +267,81 @@ fn full_save_records_floating_window_in_its_inactive_workspace() {
 }
 
 #[test]
+fn full_save_keeps_the_saved_frame_of_a_floating_window_parked_offscreen() {
+    let mut engine = test_engine();
+    let mut window_store = WindowStore::default();
+    let space = SpaceId::new(125);
+    let size = CGSize::new(1200.0, 800.0);
+    let placed = objc2_core_foundation::CGRect::new(
+        objc2_core_foundation::CGPoint::new(40.0, 50.0),
+        CGSize::new(640.0, 480.0),
+    );
+    // Windows of a workspace that is not showing sit parked just off the display.
+    let parked = objc2_core_foundation::CGRect::new(
+        objc2_core_foundation::CGPoint::new(1199.0, 799.0),
+        CGSize::new(640.0, 480.0),
+    );
+    let window = WindowId::new(41, 8);
+    let _ = engine.handle_event(&mut window_store, LayoutEvent::SpaceExposed(space, size));
+    let active_workspace = engine.workspaces().active_workspace(space).unwrap();
+    let hidden_workspace = engine
+        .workspaces
+        .list_workspaces(space)
+        .into_iter()
+        .map(|(workspace, _)| workspace)
+        .find(|workspace| *workspace != active_workspace)
+        .unwrap();
+    window_store.insert_window(window, WindowState {
+        info: WindowInfo {
+            has_native_tabs: false,
+            is_standard: true,
+            is_root: true,
+            is_minimized: false,
+            is_resizable: true,
+            min_size: None,
+            max_size: None,
+            title: "Parked floating".into(),
+            frame: parked,
+            sys_id: Some(WindowServerId::new(4108)),
+            bundle_id: Some("com.example.floating".into()),
+            path: None,
+            ax_role: None,
+            ax_subrole: None,
+        },
+        frame_monotonic: parked,
+        is_manageable: true,
+        manage_override: None,
+    });
+    assert!(engine.workspaces.assign_window_to_workspace(
+        &mut window_store,
+        space,
+        window,
+        hidden_workspace,
+    ));
+    engine.floating.add_floating(window);
+    engine.floating_positions.store(space, hidden_workspace, window, placed);
+    let path = std::env::temp_dir().join(format!(
+        "rift-parked-floating-save-test-{}-{}.ron",
+        std::process::id(),
+        space.get(),
+    ));
+
+    engine.save_current_layout(path.clone(), &window_store, Some(space)).unwrap();
+    let loaded = LayoutEngine::load(path.clone()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(
+        engine.floating_positions.get(space, hidden_workspace, window),
+        Some(placed),
+        "saving must not replace where the window goes when its workspace shows again"
+    );
+    assert_eq!(
+        loaded.floating_positions.get(space, hidden_workspace, window),
+        Some(placed)
+    );
+}
+
+#[test]
 fn full_save_removes_stale_floating_frame_from_a_tiled_window() {
     let mut engine = test_engine();
     let mut window_store = WindowStore::default();

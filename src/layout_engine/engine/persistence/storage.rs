@@ -202,12 +202,26 @@ impl LayoutEngine {
                 };
                 self.floating_positions
                     .retain_window_location(window, (assignment.space, assignment.workspace_id));
-                self.floating_positions.store(
-                    assignment.space,
-                    assignment.workspace_id,
-                    window,
-                    state.frame_monotonic,
-                );
+                // Only a showing workspace's windows are where the user put them. The others
+                // are parked off the display, and their saved frame is where they go back to
+                // when the workspace shows again; the parked frame must not replace it.
+                let showing = self.workspaces.active_workspace(assignment.space)
+                    == Some(assignment.workspace_id);
+                if showing {
+                    self.floating_positions.store(
+                        assignment.space,
+                        assignment.workspace_id,
+                        window,
+                        state.frame_monotonic,
+                    );
+                } else {
+                    self.floating_positions.store_if_absent(
+                        assignment.space,
+                        assignment.workspace_id,
+                        window,
+                        state.frame_monotonic,
+                    );
+                }
             } else {
                 // Floating frames are type-specific state. A tiled window retaining one creates a
                 // second persisted location and makes later reconciliation order-dependent.
