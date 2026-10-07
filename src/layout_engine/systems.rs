@@ -1,10 +1,10 @@
 use enum_dispatch::enum_dispatch;
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::collections::HashMap;
-use crate::layout_engine::{Direction, LayoutKind, ResizeOrientation};
+use crate::layout_engine::{Direction, LayoutKind, Orientation, ResizeOrientation};
 
 slotmap::new_key_type! { pub struct LayoutId; }
 
@@ -131,6 +131,15 @@ pub(crate) fn reconcile_app_membership(
     AppMembershipDelta { additions, removals }
 }
 
+/// Split orientation along the longer side of `size`: horizontal unless taller than wide.
+pub(crate) fn orientation_for_size(size: CGSize) -> Orientation {
+    if size.width >= size.height {
+        Orientation::Horizontal
+    } else {
+        Orientation::Vertical
+    }
+}
+
 #[enum_dispatch]
 pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn create_layout(&mut self) -> LayoutId;
@@ -152,6 +161,10 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
         _gaps: &crate::common::config::GapSettings,
     ) {
     }
+
+    /// Display size `layout` is arranged for. Known before its first layout pass, unlike
+    /// the screen passed to `prepare_layout`.
+    fn set_layout_size_hint(&mut self, _layout: LayoutId, _size: CGSize) {}
 
     fn calculate_layout(
         &self,

@@ -105,6 +105,14 @@ window_insertion_point = "next_to_selection"
 # Use Sway-style node normalization when adding windows. This gives a new node the
 # average sibling share while preserving the relative proportions of resized nodes.
 equalize_nodes = true
+# Split the selected window along its longer side when a new window joins it: side by
+# side when it is wider than tall, stacked when taller. A container is nested when the
+# parent splits the other way.
+auto_split_by_aspect = false
+# Orientation an empty workspace's root takes when its first window arrives:
+# "horizontal", "vertical" or "auto" (vertical on portrait displays).
+# Unset keeps the root as it is (new roots start horizontal).
+# root_orientation = "auto"
 
 # these settings only apply when layout mode == "master_stack"
 [settings.layout.master_stack]

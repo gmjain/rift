@@ -1,14 +1,14 @@
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use serde::{Deserialize, Serialize};
 use slotmap::Key;
 use tracing::warn;
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::collections::HashMap;
-use crate::common::config::WindowInsertionPoint;
+use crate::common::config::{RootOrientation, WindowInsertionPoint};
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
 use crate::layout_engine::systems::{
-    LayoutSystem, WindowLayoutConstraints, reconcile_app_membership,
+    LayoutSystem, WindowLayoutConstraints, orientation_for_size, reconcile_app_membership,
 };
 use crate::layout_engine::utils::compute_tiling_area;
 use crate::layout_engine::{Direction, LayoutId, LayoutKind, Orientation, ResizeOrientation};
@@ -24,6 +24,13 @@ pub struct TraditionalLayoutSystem {
     window_insertion_point: WindowInsertionPoint,
     #[serde(skip, default)]
     equalize_nodes: bool,
+    #[serde(skip, default)]
+    auto_split_by_aspect: bool,
+    #[serde(skip, default)]
+    root_orientation: Option<RootOrientation>,
+    /// Size of the area each layout tiles, for aspect decisions when inserting windows.
+    #[serde(skip, default)]
+    layout_sizes: HashMap<LayoutId, CGSize>,
 }
 
 impl Default for TraditionalLayoutSystem {
@@ -33,6 +40,9 @@ impl Default for TraditionalLayoutSystem {
             layout_roots: Default::default(),
             window_insertion_point: WindowInsertionPoint::default(),
             equalize_nodes: true,
+            auto_split_by_aspect: false,
+            root_orientation: None,
+            layout_sizes: HashMap::default(),
         }
     }
 }
@@ -44,6 +54,9 @@ impl TraditionalLayoutSystem {
             layout_roots: Default::default(),
             window_insertion_point,
             equalize_nodes,
+            auto_split_by_aspect: false,
+            root_orientation: None,
+            layout_sizes: HashMap::default(),
         }
     }
 
@@ -52,6 +65,58 @@ impl TraditionalLayoutSystem {
     }
 
     pub fn set_equalize_nodes(&mut self, value: bool) { self.equalize_nodes = value; }
+
+    pub fn set_auto_split_by_aspect(&mut self, value: bool) { self.auto_split_by_aspect = value; }
+
+    pub fn set_root_orientation(&mut self, value: Option<RootOrientation>) {
+        self.root_orientation = value;
+    }
+
+    /// Approximate size of `node`: the layout's area divided along the splits above it.
+    /// Stack members get the whole area; gaps and window size constraints are ignored.
+    fn node_size(&self, layout: LayoutId, node: NodeId) -> Option<CGSize> {
+        let mut size = *self.layout_sizes.get(&layout)?;
+        for (child, parent) in node.ancestors_with_parent(self.map()) {
+            let Some(parent) = parent else { break };
+            let kind = self.layout(parent);
+            if kind.is_group() {
+                continue;
+            }
+            let share = self.tree.data.layout.proportion(self.map(), child)?;
+            match kind.orientation() {
+                Orientation::Horizontal => size.width *= share,
+                Orientation::Vertical => size.height *= share,
+            }
+        }
+        Some(size)
+    }
+
+    /// The split `auto_split_by_aspect` wants for a window added next to `node`.
+    fn aspect_split_kind(&self, layout: LayoutId, node: NodeId) -> Option<LayoutKind> {
+        if !self.auto_split_by_aspect {
+            return None;
+        }
+        self.node_size(layout, node)
+            .map(|size| LayoutKind::from(orientation_for_size(size)))
+    }
+
+    /// An empty root takes `root_orientation` before its first window arrives.
+    fn apply_root_orientation(&mut self, layout: LayoutId) {
+        let root = self.root(layout);
+        if !root.is_empty(self.map()) || self.layout(root).is_group() {
+            return;
+        }
+        let kind = match self.root_orientation {
+            None => return,
+            Some(RootOrientation::Horizontal) => LayoutKind::Horizontal,
+            Some(RootOrientation::Vertical) => LayoutKind::Vertical,
+            Some(RootOrientation::Auto) => match self.layout_sizes.get(&layout) {
+                Some(&size) => LayoutKind::from(orientation_for_size(size)),
+                None => return,
+            },
+        };
+        self.set_layout(root, kind);
+    }
 
     fn find_best_focus_target(&self, node: NodeId) -> Option<(NodeId, WindowId)> {
         if let Some(wid) = self.tree.data.window.at(node) {
@@ -95,10 +160,17 @@ impl TraditionalLayoutSystem {
         if let Some(parent) = parent {
             let parent_layout = self.layout(parent);
             let sibling_count = parent.children(self.map()).count();
+            // auto_split_by_aspect wants the other orientation: nest the selection in a
+            // container of it, or flip the parent when the selection is its only child.
+            let aspect_kind =
+                self.aspect_split_kind(layout, selection).filter(|&kind| kind != parent_layout);
 
-            if sibling_count >= 4 && !parent_layout.is_group() {
-                let sub_container =
-                    self.nest_in_container_internal(layout, selection, parent_layout);
+            if (aspect_kind.is_some() || sibling_count >= 4) && !parent_layout.is_group() {
+                let sub_container = self.nest_in_container_internal(
+                    layout,
+                    selection,
+                    aspect_kind.unwrap_or(parent_layout),
+                );
                 let node = self.tree.mk_node().push_back(sub_container);
                 self.split_new_sibling_from_selection(selection, node);
                 self.tree.data.window.set_window(layout, node, wid);
@@ -631,6 +703,7 @@ impl LayoutSystem for TraditionalLayoutSystem {
     }
 
     fn remove_layout(&mut self, layout: LayoutId) {
+        self.layout_sizes.remove(&layout);
         self.layout_roots.remove(layout).unwrap().remove(&mut self.tree)
     }
 
@@ -643,6 +716,20 @@ impl LayoutSystem for TraditionalLayoutSystem {
 
     fn container_tree(&self, layout: LayoutId) -> rift_protocol::ContainerTreeNode {
         self.container_tree_with_roles(layout, &HashMap::default())
+    }
+
+    fn prepare_layout(
+        &mut self,
+        layout: LayoutId,
+        screen: CGRect,
+        _constraints: &HashMap<WindowId, WindowLayoutConstraints>,
+        gaps: &crate::common::config::GapSettings,
+    ) {
+        self.layout_sizes.insert(layout, compute_tiling_area(screen, gaps).size);
+    }
+
+    fn set_layout_size_hint(&mut self, layout: LayoutId, size: CGSize) {
+        self.layout_sizes.entry(layout).or_insert(size);
     }
 
     fn calculate_layout(
@@ -773,6 +860,7 @@ impl LayoutSystem for TraditionalLayoutSystem {
     }
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
+        self.apply_root_orientation(layout);
         if self.window_insertion_point == WindowInsertionPoint::EndOfTree {
             let root = self.root(layout);
             let node = self.add_window_under(layout, root, wid);
@@ -5849,5 +5937,184 @@ mod tests {
             .proportion(&system.tree.map, right_node)
             .expect("right node proportion missing");
         assert_eq!(before, after);
+    }
+
+    fn aspect_frames(
+        system: &TraditionalLayoutSystem,
+        layout: LayoutId,
+        size: CGSize,
+    ) -> HashMap<WindowId, (f64, f64, f64, f64)> {
+        system
+            .calculate_layout(
+                layout,
+                CGRect::new(CGPoint::ZERO, size),
+                0.0,
+                &HashMap::default(),
+                &Default::default(),
+                0.0,
+                Default::default(),
+                Default::default(),
+            )
+            .into_iter()
+            .map(|(wid, r)| (wid, (r.origin.x, r.origin.y, r.size.width, r.size.height)))
+            .collect()
+    }
+
+    fn aspect_system(size: CGSize) -> (TraditionalLayoutSystem, LayoutId) {
+        let mut system = TraditionalLayoutSystem::default();
+        system.set_auto_split_by_aspect(true);
+        let layout = system.create_layout();
+        system.set_layout_size_hint(layout, size);
+        (system, layout)
+    }
+
+    #[test]
+    fn aspect_split_puts_window_beside_a_landscape_selection() {
+        let size = CGSize::new(1600.0, 1000.0);
+        let (mut system, layout) = aspect_system(size);
+        let root = system.root(layout);
+        system.set_layout(root, LayoutKind::Vertical);
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        assert_eq!(system.layout(root), LayoutKind::Horizontal);
+        let frames = aspect_frames(&system, layout, size);
+        assert_eq!(frames[&w(1)], (0.0, 0.0, 800.0, 1000.0));
+        assert_eq!(frames[&w(2)], (800.0, 0.0, 800.0, 1000.0));
+    }
+
+    #[test]
+    fn aspect_split_stacks_window_under_a_portrait_selection() {
+        let size = CGSize::new(1000.0, 1600.0);
+        let mut system = TraditionalLayoutSystem::default();
+        system.set_auto_split_by_aspect(true);
+        let layout = system.create_layout();
+        // The size comes from the last layout pass when there is no hint.
+        system.prepare_layout(
+            layout,
+            CGRect::new(CGPoint::ZERO, size),
+            &HashMap::default(),
+            &Default::default(),
+        );
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        let frames = aspect_frames(&system, layout, size);
+        assert_eq!(frames[&w(1)], (0.0, 0.0, 1000.0, 800.0));
+        assert_eq!(frames[&w(2)], (0.0, 800.0, 1000.0, 800.0));
+    }
+
+    #[test]
+    fn aspect_split_nests_when_parent_splits_the_other_way() {
+        let size = CGSize::new(1600.0, 1000.0);
+        let (mut system, layout) = aspect_system(size);
+        for idx in 1..=4 {
+            system.add_window_after_selection(layout, w(idx));
+        }
+
+        // Each new window splits the previous one along its longer side.
+        let frames = aspect_frames(&system, layout, size);
+        assert_eq!(frames[&w(1)], (0.0, 0.0, 800.0, 1000.0));
+        assert_eq!(frames[&w(2)], (800.0, 0.0, 800.0, 500.0));
+        assert_eq!(frames[&w(3)], (800.0, 500.0, 400.0, 500.0));
+        assert_eq!(frames[&w(4)], (1200.0, 500.0, 400.0, 500.0));
+        let parent = |idx| {
+            let node = system.window_node(layout, w(idx)).unwrap();
+            system.layout(node.parent(system.map()).unwrap())
+        };
+        assert_eq!(parent(1), LayoutKind::Horizontal);
+        assert_eq!(parent(2), LayoutKind::Vertical);
+        assert_eq!(parent(4), LayoutKind::Horizontal);
+    }
+
+    #[test]
+    fn aspect_split_adds_a_sibling_when_parent_already_splits_that_way() {
+        let size = CGSize::new(3000.0, 1000.0);
+        let (mut system, layout) = aspect_system(size);
+        for idx in 1..=3 {
+            system.add_window_after_selection(layout, w(idx));
+        }
+
+        let root = system.root(layout);
+        assert_eq!(root.children(system.map()).count(), 3);
+        let frames = aspect_frames(&system, layout, size);
+        assert_eq!(frames[&w(3)], (2000.0, 0.0, 1000.0, 1000.0));
+    }
+
+    #[test]
+    fn aspect_split_without_a_known_size_inserts_as_before() {
+        let mut system = TraditionalLayoutSystem::default();
+        system.set_auto_split_by_aspect(true);
+        let layout = system.create_layout();
+        for idx in 1..=3 {
+            system.add_window_after_selection(layout, w(idx));
+        }
+
+        let root = system.root(layout);
+        assert_eq!(system.layout(root), LayoutKind::Horizontal);
+        assert_eq!(root.children(system.map()).count(), 3);
+    }
+
+    #[test]
+    fn default_settings_ignore_display_aspect() {
+        let size = CGSize::new(1000.0, 1600.0);
+        let mut system = TraditionalLayoutSystem::default();
+        let layout = system.create_layout();
+        system.set_layout_size_hint(layout, size);
+        for idx in 1..=3 {
+            system.add_window_after_selection(layout, w(idx));
+        }
+
+        let root = system.root(layout);
+        assert_eq!(system.layout(root), LayoutKind::Horizontal);
+        assert_eq!(root.children(system.map()).count(), 3);
+    }
+
+    #[test]
+    fn root_orientation_auto_follows_the_display() {
+        for (size, before, after) in [
+            (
+                CGSize::new(1000.0, 1600.0),
+                LayoutKind::Horizontal,
+                LayoutKind::Vertical,
+            ),
+            (
+                CGSize::new(1600.0, 1000.0),
+                LayoutKind::Vertical,
+                LayoutKind::Horizontal,
+            ),
+        ] {
+            let mut system = TraditionalLayoutSystem::default();
+            system.set_root_orientation(Some(RootOrientation::Auto));
+            let layout = system.create_layout();
+            let root = system.root(layout);
+            system.set_layout(root, before);
+            system.set_layout_size_hint(layout, size);
+            for idx in 1..=3 {
+                system.add_window_after_selection(layout, w(idx));
+            }
+
+            assert_eq!(system.layout(root), after);
+            assert_eq!(root.children(system.map()).count(), 3);
+        }
+    }
+
+    #[test]
+    fn root_orientation_applies_only_to_an_empty_root() {
+        let mut system = TraditionalLayoutSystem::default();
+        system.set_root_orientation(Some(RootOrientation::Vertical));
+        let layout = system.create_layout();
+        let root = system.root(layout);
+        system.add_window_after_selection(layout, w(1));
+        assert_eq!(system.layout(root), LayoutKind::Vertical);
+
+        system.toggle_tile_orientation(layout);
+        system.add_window_after_selection(layout, w(2));
+        assert_eq!(system.layout(root), LayoutKind::Horizontal);
+
+        system.remove_window(w(1));
+        system.remove_window(w(2));
+        system.add_window_after_selection(layout, w(3));
+        assert_eq!(system.layout(root), LayoutKind::Vertical);
     }
 }

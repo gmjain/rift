@@ -58,6 +58,9 @@ impl WorkspaceLayoutState {
                 self.last_saved = Some(*entry.get());
             }
         }
+        if let Some(layout) = self.active() {
+            tree.set_layout_size_hint(layout, size);
+        }
     }
 
     pub(crate) fn replace(&mut self, layout: LayoutId) {
