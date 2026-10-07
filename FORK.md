@@ -22,6 +22,11 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
 | 5 | PR #545: display-bound workspaces, multi-display fixes | `ddbba62` to `0cba564` (11) | done |
 | 6 | i3-style global workspaces (`[virtual_workspaces] scope = "global"`) | `08c84dc` to `7cb53d5` (12) | done, off by default |
 | 7 | aspect split (`auto_split_by_aspect`, `root_orientation`) | `09846e2`, `0d5abcf` | done, off by default |
+| 8 | test isolation: unit tests never call into the live WindowServer | `fda497c` to `4436091` (5) | done (test-only) |
+| 9 | layout persistence: `[settings.persistence]` autosave, `restore_on_start`, same-boot id matching | `c2db77f` to `75a2ce7` (5) | done, off by default |
+| 10 | menu bar: dashed frame around a workspace with a fullscreen window | `e8b0b43`, `adbe92a` | done |
+| 11 | native window borders + dimming (`[settings.ui.border]`, `[settings.ui.dim]`) | `b17bd6e` to `7171c2c` (6) | done, off by default |
+| 12 | floating windows above tiled ones (`[settings] floating_windows_on_top`) | `ca789bf`, `d63800c` | done, off by default |
 
 - Rows 1-4 are the former local branch `wms/fixes` (base 3a99afa, v0.6.7), rebased onto
   upstream 0.6.8. Root-cause write-ups: `wms/docs/incidents/2026-10-05-rift-*.md`.
@@ -30,6 +35,17 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
 - Rows 6-7 change nothing until configured: `scope` defaults to `"per_display"`, the aspect keys
   to off. Design and review: `wms/docs/rift-global-workspaces.md`,
   `wms/docs/rift-fork-review-2026-10-06.md`.
+- Row 8 is `cfg(test)`-only (production paths unchanged): fakes for window-server queries, no
+  cursor/notification/event posting into the session, live SkyLight screen tests serialized.
+  Four of the five commits apply upstream as they are.
+- Row 9: autosave and `restore_on_start` default to off. Always on: layout files record the
+  boot (`kern.bootsessionuuid`) and a file from this boot matches windows by process +
+  WindowServer id alone; saves keep hidden floating frames; a saved window that shares a live
+  window's id but does not match it no longer drops that window from the layout. Tooling:
+  `wm restart-rift`, `wm to-rift --restore` (`wms/docs/switching.md`).
+- Row 10 has no config key. Rows 11-12 change nothing until enabled; design and limits:
+  `wms/docs/rift-borders.md`. Review of rows 8-12: `wms/docs/rift-fork-review-2026-10-06.md`
+  (second pass).
 - Status values: planned, in progress, done (on `main`), live (deployed), upstreamed, dropped.
 - Update this table in the same commit that changes a patch's status.
 
