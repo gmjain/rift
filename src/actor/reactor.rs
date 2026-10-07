@@ -2489,6 +2489,13 @@ impl Reactor {
                     );
                     return Ok(EventOutcome::no_change());
                 }
+                if self.has_global_workspaces() {
+                    return self.move_workspace_to_display_keeping_layout(
+                        source_space,
+                        target_space,
+                        &target_screen,
+                    );
+                }
 
                 let windows = self
                     .layout_manager

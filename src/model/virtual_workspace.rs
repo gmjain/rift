@@ -61,6 +61,11 @@ pub struct VirtualWorkspace {
     pub layout_mode: LayoutMode,
     #[serde(default)]
     pub(crate) layout_state: WorkspaceLayoutState,
+    /// With global workspaces: the display this workspace lived on before that
+    /// display disconnected, by UUID. It goes back there when the display
+    /// returns. Absent in layout files written before the setting existed.
+    #[serde(default)]
+    pub(crate) home_display: Option<String>,
 }
 
 fn default_layout_system_kind() -> LayoutSystemKind {
@@ -77,6 +82,7 @@ impl VirtualWorkspace {
             layout_system,
             layout_mode: mode,
             layout_state: WorkspaceLayoutState::default(),
+            home_display: None,
         }
     }
 
@@ -148,6 +154,40 @@ impl VirtualWorkspace {
     }
 
     pub fn last_focused(&self) -> Option<WindowId> { self.last_focused }
+
+    /// Take the workspace's layout and focus state, leaving an empty layout of
+    /// the same mode behind.
+    fn take_payload(&mut self, settings: &LayoutSettings) -> WorkspacePayload {
+        let mode = self.layout_mode;
+        WorkspacePayload {
+            layout_system: std::mem::replace(
+                &mut self.layout_system,
+                Self::create_layout_system(mode, settings),
+            ),
+            layout_mode: mode,
+            layout_state: std::mem::take(&mut self.layout_state),
+            last_focused: self.last_focused.take(),
+            home_display: self.home_display.take(),
+        }
+    }
+
+    fn put_payload(&mut self, payload: WorkspacePayload) {
+        self.layout_system = payload.layout_system;
+        self.layout_mode = payload.layout_mode;
+        self.layout_state = payload.layout_state;
+        self.last_focused = payload.last_focused;
+        self.home_display = payload.home_display;
+    }
+}
+
+/// Everything that makes a workspace copy the workspace: see
+/// [`WorkspaceStore::swap_workspace_payloads`].
+struct WorkspacePayload {
+    layout_system: LayoutSystemKind,
+    layout_mode: LayoutMode,
+    layout_state: WorkspaceLayoutState,
+    last_focused: Option<WindowId>,
+    home_display: Option<String>,
 }
 
 /// Owns virtual workspace topology and workspace-scoped layout configurations.
@@ -502,6 +542,44 @@ impl WorkspaceStore {
 
     /// The back-and-forth target shared by all displays, by position.
     pub(crate) fn global_last_workspace(&self) -> Option<usize> { self.global_last_workspace }
+
+    /// Forget where workspace `index` of `space` lived before its display went
+    /// away: the user put it somewhere on purpose.
+    pub(crate) fn clear_home_display(&mut self, space: SpaceId, index: usize) {
+        if let Some(id) = self.workspace_ids(space).get(index).copied() {
+            self.workspaces[id].home_display = None;
+        }
+    }
+
+    /// The number of workspaces each native space holds: the configured count,
+    /// or more once workspaces were created at runtime.
+    pub(crate) fn workspace_count(&self) -> usize {
+        self.workspaces_by_space
+            .values()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(self.default_workspace_count.max(1).min(self.max_workspaces.max(1)))
+    }
+
+    /// Exchange everything but name and native space between two workspaces:
+    /// layout trees, layout mode, per-size configurations and focus memory.
+    /// With global workspaces this moves a workspace between displays while
+    /// every space keeps its copy at the same position.
+    pub(crate) fn swap_workspace_payloads(
+        &mut self,
+        a: VirtualWorkspaceId,
+        b: VirtualWorkspaceId,
+    ) -> bool {
+        if a == b || !self.workspaces.contains_key(a) || !self.workspaces.contains_key(b) {
+            return false;
+        }
+        let payload_a = self.workspaces[a].take_payload(&self.layout_settings);
+        let payload_b = self.workspaces[b].take_payload(&self.layout_settings);
+        self.workspaces[a].put_payload(payload_b);
+        self.workspaces[b].put_payload(payload_a);
+        true
+    }
 
     fn resolve_layout_mode_for_workspace(&self, index: usize, name: &str) -> LayoutMode {
         // Check workspace_rules (last matching rule wins, like app_rules)
