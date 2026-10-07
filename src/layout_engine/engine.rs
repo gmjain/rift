@@ -2724,6 +2724,28 @@ impl LayoutEngine {
         )
     }
 
+    /// Whether `workspace` holds a window in Rift's fullscreen: a tiled node toggled with
+    /// `toggle-fullscreen(-within-gaps)`, or a floating window toggled to fullscreen.
+    /// Native macOS fullscreen is not tracked by the layout engine and does not count.
+    pub(crate) fn workspace_has_fullscreen(
+        &self,
+        window_store: &WindowStore,
+        space: SpaceId,
+        workspace: VirtualWorkspaceId,
+    ) -> bool {
+        let tiled = self.workspaces.active_layout(space, workspace).is_some_and(|layout| {
+            self.workspaces[workspace].layout_system.has_any_fullscreen_node(layout)
+        });
+        tiled
+            || self
+                .workspaces
+                .workspace_windows(window_store, space, workspace)
+                .into_iter()
+                .any(|wid| {
+                    self.floating.is_floating(wid) && self.floating.fullscreen_kind(wid).is_some()
+                })
+    }
+
     pub fn active_workspace_for_space_has_fullscreen(&mut self, space: SpaceId) -> bool {
         let Some((ws_id, layout_id)) = self.workspaces.active_layout_for_space(space) else {
             return false;

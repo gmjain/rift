@@ -144,6 +144,11 @@ pub struct WorkspaceData {
     /// display does.
     #[serde(default)]
     pub display_uuid: Option<String>,
+    /// True while a window in the workspace is in Rift's fullscreen
+    /// (`toggle-fullscreen` or `toggle-fullscreen-within-gaps`, tiled or
+    /// floating). Native macOS fullscreen does not count.
+    #[serde(default)]
+    pub has_fullscreen: bool,
     /// Workspace windows in logical column-major order when the layout has column semantics.
     /// Windows without a logical position follow in their existing stable order.
     pub windows: Vec<WindowData>,

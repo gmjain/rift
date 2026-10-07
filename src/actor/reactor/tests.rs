@@ -7842,6 +7842,161 @@ fn floating_window_toggles_to_fullscreen_within_gaps() {
     );
 }
 
+fn last_menu_update(rx: &mut crate::actor::Receiver<menu_bar::Event>) -> menu_bar::Update {
+    let mut last = None;
+    while let Ok((_, event)) = rx.try_recv() {
+        if let menu_bar::Event::Update(update) = event {
+            last = Some(update);
+        }
+    }
+    last.expect("expected a menu update")
+}
+
+/// Per-workspace fullscreen flags as `query workspaces` reports them and as
+/// the last menu bar update carried them.
+fn fullscreen_flags(
+    reactor: &mut Reactor,
+    rx: &mut crate::actor::Receiver<menu_bar::Event>,
+    space: SpaceId,
+) -> (Vec<bool>, Vec<bool>) {
+    let queried = reactor
+        .query_workspaces(Some(space))
+        .into_iter()
+        .map(|workspace| {
+            let flag = workspace.has_fullscreen;
+            let wire = serde_json::to_value(rift_protocol::WorkspaceData::from(workspace))
+                .expect("workspace serializes");
+            assert_eq!(wire["has_fullscreen"], flag, "query workspaces wire format");
+            flag
+        })
+        .collect();
+    let update = last_menu_update(rx);
+    let display = update
+        .displays
+        .iter()
+        .find(|display| display.space == space)
+        .expect("display listed");
+    let menu = display.workspaces.iter().map(|workspace| workspace.has_fullscreen).collect();
+    (queried, menu)
+}
+
+#[test]
+fn workspace_data_reports_tiled_fullscreen_for_its_workspace_only() {
+    for mode in [
+        LayoutMode::Traditional,
+        LayoutMode::Bsp,
+        LayoutMode::MasterStack,
+        LayoutMode::Scrolling,
+        LayoutMode::Stack,
+    ] {
+        let (mut apps, mut reactor) = test_context_with_workspace_count(3);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let space = SpaceId::new(1);
+        apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(2));
+        reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+            workspace: WorkspaceSelector::Index(1),
+            follow: false,
+            window_id: Some(2),
+        });
+        reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+            workspace: None,
+            mode,
+        });
+        apps.simulate_until_quiet(&mut reactor);
+        let (tx, mut rx) = crate::actor::channel();
+        reactor.menu_manager.menu_tx = Some(tx);
+        reactor.maybe_send_menu_update();
+        let none = vec![false, false, false];
+        assert_eq!(
+            fullscreen_flags(&mut reactor, &mut rx, space),
+            (none.clone(), none.clone())
+        );
+
+        for command in [
+            LayoutCommand::ToggleFullscreen,
+            LayoutCommand::ToggleFullscreenWithinGaps,
+        ] {
+            reactor.handle_test_layout_command(command.clone());
+            apps.simulate_until_quiet(&mut reactor);
+            let only_first = vec![true, false, false];
+            assert_eq!(
+                fullscreen_flags(&mut reactor, &mut rx, space),
+                (only_first.clone(), only_first.clone()),
+                "{mode:?} {command:?} on"
+            );
+
+            // An inactive workspace keeps reporting its fullscreen window.
+            reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+            apps.simulate_until_quiet(&mut reactor);
+            assert!(reactor.query_workspaces(Some(space))[1].is_active);
+            assert_eq!(
+                fullscreen_flags(&mut reactor, &mut rx, space),
+                (only_first.clone(), only_first),
+                "{mode:?} {command:?} while inactive"
+            );
+            reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(0));
+            apps.simulate_until_quiet(&mut reactor);
+
+            reactor.handle_test_layout_command(command.clone());
+            apps.simulate_until_quiet(&mut reactor);
+            assert_eq!(
+                fullscreen_flags(&mut reactor, &mut rx, space),
+                (none.clone(), none.clone()),
+                "{mode:?} {command:?} off"
+            );
+        }
+    }
+}
+
+#[test]
+fn workspace_data_reports_floating_fullscreen() {
+    let (mut reactor, _wid, space, _screen, _frame) = reactor_with_floating_window();
+    let (tx, mut rx) = crate::actor::channel();
+    reactor.menu_manager.menu_tx = Some(tx);
+    let active = reactor
+        .query_workspaces(Some(space))
+        .iter()
+        .position(|workspace| workspace.is_active)
+        .expect("active workspace");
+    let count = reactor.query_workspaces(Some(space)).len();
+    let none = vec![false; count];
+    let mut only_active = none.clone();
+    only_active[active] = true;
+
+    for command in [
+        LayoutCommand::ToggleFullscreen,
+        LayoutCommand::ToggleFullscreenWithinGaps,
+    ] {
+        reactor.handle_test_layout_command(command.clone());
+        assert_eq!(
+            fullscreen_flags(&mut reactor, &mut rx, space),
+            (only_active.clone(), only_active.clone()),
+            "{command:?} on"
+        );
+        reactor.handle_test_layout_command(command.clone());
+        assert_eq!(
+            fullscreen_flags(&mut reactor, &mut rx, space),
+            (none.clone(), none.clone()),
+            "{command:?} off"
+        );
+    }
+}
+
+#[test]
+fn workspace_data_without_has_fullscreen_deserializes_as_false() {
+    let json = serde_json::json!({
+        "id": "VirtualWorkspaceId(1v1)",
+        "index": 0,
+        "name": "main",
+        "layout_mode": "bsp",
+        "is_active": true,
+        "window_count": 0,
+        "windows": [],
+    });
+    let workspace: rift_protocol::WorkspaceData = serde_json::from_value(json).unwrap();
+    assert!(!workspace.has_fullscreen);
+}
+
 #[test]
 fn display_churn_release_still_flushes_the_deferred_inventory_refresh() {
     let (mut apps, mut reactor) = test_context();
@@ -9830,6 +9985,46 @@ fn global_workspaces_menu_bar_lists_each_display_its_own_and_the_unowned_workspa
         "the left display: its ws0 and the unowned ws3, by their shared index"
     );
     assert_eq!(listed(right_space), vec![(1, true), (2, false), (3, false)]);
+}
+
+#[test]
+fn global_workspaces_menu_bar_marks_fullscreen_on_the_owning_display_only() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    focus_display_space(&mut reactor, right_space);
+    let _on_right = open_window_on_right(&mut apps, &mut reactor, 2);
+    let (tx, mut rx) = crate::actor::channel();
+    reactor.menu_manager.menu_tx = Some(tx);
+
+    let listed = |update: &menu_bar::Update, space: SpaceId| -> Vec<(usize, bool)> {
+        update
+            .displays
+            .iter()
+            .find(|display| display.space == space)
+            .expect("display listed")
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.index, workspace.has_fullscreen))
+            .collect()
+    };
+    reactor.handle_test_layout_command(LayoutCommand::ToggleFullscreen);
+    apps.simulate_until_quiet(&mut reactor);
+    let update = last_menu_update(&mut rx);
+    assert_eq!(listed(&update, left_space), vec![
+        (0, false),
+        (2, false),
+        (3, false)
+    ]);
+    assert_eq!(listed(&update, right_space), vec![
+        (1, true),
+        (2, false),
+        (3, false)
+    ]);
+
+    reactor.handle_test_layout_command(LayoutCommand::ToggleFullscreen);
+    apps.simulate_until_quiet(&mut reactor);
+    let update = last_menu_update(&mut rx);
+    assert!(update.displays.iter().flat_map(|d| &d.workspaces).all(|ws| !ws.has_fullscreen));
 }
 
 #[test]

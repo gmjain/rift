@@ -439,6 +439,14 @@ impl Reactor {
                 space_id.and_then(|space| self.display_uuid_holding_space(space))
             };
 
+            let has_fullscreen = space_id.is_some_and(|space| {
+                self.layout_manager.layout_engine.workspace_has_fullscreen(
+                    &self.state.windows,
+                    space,
+                    *workspace_id,
+                )
+            });
+
             workspaces.push(RuntimeWorkspaceData {
                 workspace_id: *workspace_id,
                 space: space_id.unwrap(),
@@ -450,6 +458,7 @@ impl Reactor {
                 windows,
                 index,
                 display_uuid,
+                has_fullscreen,
             });
         }
 
