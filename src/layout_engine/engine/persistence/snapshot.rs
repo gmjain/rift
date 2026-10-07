@@ -31,6 +31,9 @@ pub(super) struct PersistedLayout {
     pub(super) space_display_map: HashMap<SpaceId, Option<String>>,
     #[serde(default)]
     pub(super) display_last_space: HashMap<String, SpaceId>,
+    /// The boot the file was saved in; absent in files written before it was recorded.
+    #[serde(default)]
+    pub(super) boot_session: Option<String>,
     #[serde(flatten)]
     pub(super) persistence: PersistenceState,
 }
@@ -45,6 +48,7 @@ struct PersistedLayoutRef<'a> {
     workspaces: &'a WorkspaceStore,
     space_display_map: &'a HashMap<SpaceId, Option<String>>,
     display_last_space: &'a HashMap<String, SpaceId>,
+    boot_session: Option<&'a str>,
     #[serde(flatten)]
     persistence: &'a PersistenceState,
 }
@@ -62,6 +66,7 @@ impl PersistedLayout {
             workspaces: &engine.workspaces,
             space_display_map: &engine.space_display_map,
             display_last_space: &engine.display_last_space,
+            boot_session: current_boot_session(),
             persistence: &engine.persistence,
         })
         .expect("persisted layout serialization must support all engine layout state")
@@ -91,7 +96,9 @@ impl PersistedLayout {
             .map_err(|error| anyhow::anyhow!("invalid workspace layouts: {error}"))
     }
 
-    pub(super) fn into_engine(self) -> LayoutEngine {
+    pub(super) fn into_engine(mut self) -> LayoutEngine {
+        self.persistence.trusted_window_ids =
+            self.boot_session.is_some() && self.boot_session.as_deref() == current_boot_session();
         LayoutEngine {
             scroll_boundary: None,
             floating: self.floating,

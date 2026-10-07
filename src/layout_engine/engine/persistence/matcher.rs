@@ -19,19 +19,23 @@ pub(super) struct MatchDecision {
 ///
 /// Keeping ranking pure makes matching deterministic and prevents a rejected low-confidence
 /// candidate from partially changing trees, floating state, or pending identities.
+///
+/// `trust_window_ids`: the candidates were saved in this boot, so the saved WindowServer id of
+/// the live window's own id is proof enough (see `PersistenceState::trusted_window_ids`).
 pub(super) fn choose_match(
     live: WindowId,
     live_space: SpaceId,
     fingerprint: &WindowFingerprint,
     preferred_location: Option<WorkspaceLocation>,
     candidates: &[RestoreCandidate<'_>],
+    trust_window_ids: bool,
 ) -> Option<MatchDecision> {
     // WindowId is process-local, so it is direct evidence only while stronger saved identity does
     // not contradict it. If WindowServer identity disagrees, let the genuine server-id candidate
     // win rather than trusting an id that may have been reused since the file was written.
     let direct = candidates.iter().find(|candidate| {
         candidate.window == live
-            && candidate.fingerprint.direct_identity_compatible_with(fingerprint)
+            && same_window(candidate.fingerprint, fingerprint, trust_window_ids)
     });
     let server_id_match =
         direct.is_none().then(|| fingerprint.window_server_id).flatten().and_then(
@@ -83,6 +87,16 @@ pub(super) fn choose_match(
         exact_identity,
         duplicate_identities,
     })
+}
+
+/// Whether a saved fingerprint and a live one with the same WindowId are the same window.
+pub(super) fn same_window(
+    saved: &WindowFingerprint,
+    live: &WindowFingerprint,
+    trust_window_ids: bool,
+) -> bool {
+    saved.direct_identity_compatible_with(live)
+        || (trust_window_ids && saved.same_window_server_window(live))
 }
 
 fn choose_fallback(

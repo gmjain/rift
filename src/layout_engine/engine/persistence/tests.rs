@@ -1737,6 +1737,7 @@ fn pure_matcher_reports_duplicate_identities_without_mutating_candidates() {
         &fingerprint,
         Some((space, preferred_workspace)),
         &candidates,
+        false,
     )
     .unwrap();
 
@@ -1787,7 +1788,7 @@ fn reused_process_local_identity_defers_to_window_server_identity() {
         },
     ];
 
-    let decision = choose_match(live, space, &live_fingerprint, None, &candidates).unwrap();
+    let decision = choose_match(live, space, &live_fingerprint, None, &candidates, false).unwrap();
 
     assert_eq!(decision.selected, other);
     assert!(decision.exact_identity);
@@ -1829,7 +1830,7 @@ fn reused_direct_window_identity_cannot_cross_known_application_identity() {
         },
     ];
 
-    let decision = choose_match(live, space, &right_app, None, &candidates).unwrap();
+    let decision = choose_match(live, space, &right_app, None, &candidates, false).unwrap();
 
     assert_eq!(decision.selected, compatible);
     assert!(decision.exact_identity);
@@ -1862,14 +1863,14 @@ fn fuzzy_match_requires_known_app_and_title_but_not_size() {
         location: Some((space, crate::model::VirtualWorkspaceId::default())),
     }];
 
-    assert!(choose_match(live, space, &unrelated_live, None, &candidate).is_none());
+    assert!(choose_match(live, space, &unrelated_live, None, &candidate, false).is_none());
 
     let title_only_match = WindowFingerprint {
         title: Some("Music".into()),
         ..unrelated_live
     };
     assert_eq!(
-        choose_match(live, space, &title_only_match, None, &candidate)
+        choose_match(live, space, &title_only_match, None, &candidate, false)
             .map(|decision| decision.selected),
         Some(saved)
     );
@@ -1880,7 +1881,7 @@ fn fuzzy_match_requires_known_app_and_title_but_not_size() {
         ..title_only_match
     };
     assert_eq!(
-        choose_match(live, space, &title_and_size_match, None, &candidate)
+        choose_match(live, space, &title_and_size_match, None, &candidate, false)
             .map(|decision| decision.selected),
         Some(saved)
     );
@@ -1907,7 +1908,8 @@ fn fuzzy_match_requires_known_app_and_title_but_not_size() {
             space,
             &common_title_different_size,
             None,
-            &unknown_candidate
+            &unknown_candidate,
+            false
         )
         .is_none()
     );
@@ -1953,7 +1955,7 @@ fn fuzzy_match_uses_size_to_disambiguate_duplicate_app_titles() {
     ];
 
     assert_eq!(
-        choose_match(live, space, &live_fingerprint, None, &candidates)
+        choose_match(live, space, &live_fingerprint, None, &candidates, false)
             .map(|decision| decision.selected),
         Some(near)
     );
@@ -1988,7 +1990,7 @@ fn fuzzy_match_rejects_equal_size_ambiguity_for_duplicate_app_titles() {
         },
     ];
 
-    assert!(choose_match(live, space, &fingerprint, None, &candidates).is_none());
+    assert!(choose_match(live, space, &fingerprint, None, &candidates, false).is_none());
 }
 
 #[test]
@@ -2535,4 +2537,88 @@ fn legacy_workspace_layouts_migrate_and_round_trip() {
                 .contains("invalid workspace layouts")
         );
     }
+}
+
+#[test]
+fn a_window_server_id_saved_in_this_boot_matches_whatever_the_title() {
+    use super::matcher::{RestoreCandidate, choose_match};
+    let space = SpaceId::new(1);
+    let window = WindowId::new(70, 4242);
+    let saved = WindowFingerprint {
+        window_server_id: Some(4242),
+        title: Some("~/src: vim".into()),
+        width: 800.0,
+        height: 600.0,
+        app_id: None,
+    };
+    let live = WindowFingerprint {
+        title: Some("~/src: cargo test".into()),
+        width: 400.0,
+        height: 600.0,
+        ..saved.clone()
+    };
+    let candidate = [RestoreCandidate {
+        window,
+        fingerprint: &saved,
+        location: Some((space, crate::model::VirtualWorkspaceId::default())),
+    }];
+
+    let matched = choose_match(window, space, &live, None, &candidate, true).unwrap();
+    assert_eq!(matched.selected, window);
+    assert!(matched.exact_identity);
+    assert!(
+        choose_match(window, space, &live, None, &candidate, false).is_none(),
+        "from another boot, the same id is only a coincidence"
+    );
+
+    let other_app = WindowFingerprint {
+        app_id: Some("com.example.other".into()),
+        ..live.clone()
+    };
+    let known_app = [RestoreCandidate {
+        fingerprint: &WindowFingerprint {
+            app_id: Some("com.example.terminal".into()),
+            ..saved.clone()
+        },
+        ..candidate[0]
+    }];
+    assert!(
+        choose_match(window, space, &other_app, None, &known_app, true).is_none(),
+        "two known, different apps are never the same window"
+    );
+    let other_window = WindowFingerprint {
+        window_server_id: Some(4243),
+        ..live
+    };
+    assert!(choose_match(window, space, &other_window, None, &candidate, true).is_none());
+}
+
+#[test]
+fn a_layout_file_records_its_boot_and_only_this_boot_trusts_its_ids() {
+    let engine = test_engine();
+    let serialized = engine.serialize_to_string();
+    let session = super::current_boot_session().expect("macOS reports a boot session");
+    assert!(serialized.contains(&format!(r#""boot_session":Some("{session}")"#)));
+    assert!(
+        LayoutEngine::deserialize_from_str(&serialized)
+            .unwrap()
+            .persistence
+            .trusted_window_ids
+    );
+
+    let other_boot = serialized.replace(session, "another boot");
+    assert!(
+        !LayoutEngine::deserialize_from_str(&other_boot)
+            .unwrap()
+            .persistence
+            .trusted_window_ids
+    );
+    let older = serialized.replace(&format!(r#""boot_session":Some("{session}"),"#), "");
+    assert!(!older.contains("boot_session"));
+    assert!(
+        !LayoutEngine::deserialize_from_str(&older)
+            .unwrap()
+            .persistence
+            .trusted_window_ids
+    );
 }

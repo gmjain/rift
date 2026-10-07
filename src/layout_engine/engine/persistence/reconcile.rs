@@ -214,9 +214,14 @@ impl LayoutEngine {
                 })
             })
             .collect();
-        let Some(decision) =
-            choose_match(live, live_space, fingerprint, preferred_location, &candidates)
-        else {
+        let Some(decision) = choose_match(
+            live,
+            live_space,
+            fingerprint,
+            preferred_location,
+            &candidates,
+            self.persistence.trusted_window_ids,
+        ) else {
             return ReconcileOutcome::default();
         };
         let old = decision.selected;

@@ -29,6 +29,8 @@ struct RestorePlan {
     workspaces: Vec<WorkspaceRestoreState>,
     target_active: Option<VirtualWorkspaceId>,
     fingerprints: Vec<(WindowId, WindowFingerprint)>,
+    /// The file was saved in this boot (see `PersistenceState::trusted_window_ids`).
+    trusted_window_ids: bool,
 }
 
 impl RestorePlan {
@@ -266,6 +268,7 @@ impl RestorePlan {
             workspaces,
             target_active,
             fingerprints,
+            trusted_window_ids: snapshot.persistence.trusted_window_ids,
         })
     }
 
@@ -307,6 +310,8 @@ impl RestorePlan {
             engine.persistence.record(window, fingerprint);
         }
         engine.persistence.replace_pending(restored_candidates);
+        // Whether saved WindowServer ids prove identity depends on the file being restored.
+        engine.persistence.trusted_window_ids = self.trusted_window_ids;
 
         // A scoped restore must not consume a live identity outside its exact target. WindowId is
         // explicitly process-local and can be reused across sessions. Detach an imported
@@ -329,10 +334,10 @@ impl RestorePlan {
             let live_is_in_scope = live_assignment.is_some_and(|assignment| {
                 restored_targets.contains(&(assignment.space, assignment.workspace_id))
             });
-            let identity_is_compatible = engine
-                .persistence
-                .fingerprint(*live)
-                .is_some_and(|saved| saved.direct_identity_compatible_with(fingerprint));
+            let identity_is_compatible =
+                engine.persistence.fingerprint(*live).is_some_and(|saved| {
+                    super::matcher::same_window(saved, fingerprint, self.trusted_window_ids)
+                });
             if live_is_in_scope && identity_is_compatible {
                 continue;
             }
