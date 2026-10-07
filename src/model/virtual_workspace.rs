@@ -135,6 +135,7 @@ impl VirtualWorkspace {
                     settings.window_insertion_point_for(mode),
                 );
                 system.set_single_window_aspect_ratio(settings.bsp.single_window_aspect_ratio);
+                system.set_auto_split_by_aspect(settings.bsp.auto_split_by_aspect);
                 LayoutSystemKind::Bsp(system)
             }
             LayoutMode::Stack => LayoutSystemKind::Stack(

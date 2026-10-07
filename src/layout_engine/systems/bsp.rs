@@ -7,7 +7,7 @@ use crate::common::collections::HashMap;
 use crate::common::config::WindowInsertionPoint;
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
 use crate::layout_engine::systems::{
-    LayoutSystem, WindowLayoutConstraints, reconcile_app_membership,
+    LayoutSystem, WindowLayoutConstraints, orientation_for_size, reconcile_app_membership,
 };
 use crate::layout_engine::utils::compute_tiling_area;
 use crate::layout_engine::{Direction, LayoutId, LayoutKind, Orientation, ResizeOrientation};
@@ -46,6 +46,11 @@ pub struct BspLayoutSystem {
     window_insertion_point: WindowInsertionPoint,
     #[serde(skip, default)]
     single_window_aspect_ratio: Option<f64>,
+    #[serde(skip, default)]
+    auto_split_by_aspect: bool,
+    /// Size of the area each layout tiles, for aspect decisions when inserting windows.
+    #[serde(skip, default)]
+    layout_sizes: HashMap<LayoutId, CGSize>,
 }
 
 impl BspLayoutSystem {
@@ -204,6 +209,8 @@ impl Default for BspLayoutSystem {
             stacks: Default::default(),
             window_insertion_point: WindowInsertionPoint::default(),
             single_window_aspect_ratio: None,
+            auto_split_by_aspect: false,
+            layout_sizes: HashMap::default(),
         }
     }
 }
@@ -222,6 +229,26 @@ impl BspLayoutSystem {
 
     pub fn set_single_window_aspect_ratio(&mut self, ratio: Option<f64>) {
         self.single_window_aspect_ratio = ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    }
+
+    pub fn set_auto_split_by_aspect(&mut self, value: bool) { self.auto_split_by_aspect = value; }
+
+    /// Approximate size of `node`: the layout's area divided by the split ratios above it.
+    fn node_size(&self, layout: LayoutId, node: NodeId) -> Option<CGSize> {
+        let mut size = *self.layout_sizes.get(&layout)?;
+        let mut current = node;
+        while let Some(parent) = current.parent(&self.tree.map) {
+            if let Some(NodeKind::Split { orientation, ratio }) = self.kind.get(parent) {
+                let first = parent.first_child(&self.tree.map) == Some(current);
+                let share = f64::from(if first { *ratio } else { 1.0 - ratio });
+                match orientation {
+                    Orientation::Horizontal => size.width *= share,
+                    Orientation::Vertical => size.height *= share,
+                }
+            }
+            current = parent;
+        }
+        Some(size)
     }
 
     fn index_window(&mut self, wid: WindowId, node: NodeId) {
@@ -466,9 +493,14 @@ impl BspLayoutSystem {
                     if let Some(w) = existing {
                         self.index_window(w, left);
                     }
-                    // Use alternating orientations based on depth for fibonacci spiral
-                    let depth = self.node_depth(sel);
-                    let orientation = self.orientation_for_depth(depth);
+                    // Split along the leaf's longer side with auto_split_by_aspect, else
+                    // alternate orientations by depth for a fibonacci spiral.
+                    let orientation = self
+                        .auto_split_by_aspect
+                        .then(|| self.node_size(layout, sel))
+                        .flatten()
+                        .map(orientation_for_size)
+                        .unwrap_or_else(|| self.orientation_for_depth(self.node_depth(sel)));
                     self.kind.insert(sel, NodeKind::Split { orientation, ratio: 0.5 });
                     left.detach(&mut self.tree).push_back(sel);
                     right.detach(&mut self.tree).push_back(sel);
@@ -912,6 +944,46 @@ mod tests {
     }
 
     #[test]
+    fn aspect_split_follows_leaf_shape_instead_of_depth() {
+        let size = CGSize::new(1000.0, 1600.0);
+        let frames = |auto_split_by_aspect| {
+            let mut system = BspLayoutSystem::default();
+            system.set_auto_split_by_aspect(auto_split_by_aspect);
+            let layout = system.create_layout();
+            system.set_layout_size_hint(layout, size);
+            for idx in 1..=3 {
+                system.add_window_after_selection(layout, w(idx));
+            }
+            let frames: HashMap<_, _> = system
+                .calculate_layout(
+                    layout,
+                    CGRect::new(CGPoint::ZERO, size),
+                    0.0,
+                    &HashMap::default(),
+                    &Default::default(),
+                    0.0,
+                    Default::default(),
+                    Default::default(),
+                )
+                .into_iter()
+                .map(|(wid, r)| (wid, (r.origin.x, r.origin.y, r.size.width, r.size.height)))
+                .collect();
+            frames
+        };
+
+        // Portrait display: stacked first, then the landscape bottom half side by side.
+        let aspect = frames(true);
+        assert_eq!(aspect[&w(1)], (0.0, 0.0, 1000.0, 800.0));
+        assert_eq!(aspect[&w(2)], (0.0, 800.0, 500.0, 800.0));
+        assert_eq!(aspect[&w(3)], (500.0, 800.0, 500.0, 800.0));
+
+        // Off by default: side by side first, by depth.
+        let depth = frames(false);
+        assert_eq!(depth[&w(1)], (0.0, 0.0, 500.0, 1600.0));
+        assert_eq!(depth[&w(2)], (500.0, 0.0, 500.0, 800.0));
+    }
+
+    #[test]
     fn max_only_width_cap_reclaims_space_for_sibling() {
         let mut system = BspLayoutSystem::default();
         let layout = system.create_layout();
@@ -1105,6 +1177,7 @@ impl LayoutSystem for BspLayoutSystem {
     }
 
     fn remove_layout(&mut self, layout: LayoutId) {
+        self.layout_sizes.remove(&layout);
         if let Some(state) = self.layouts.remove(layout) {
             let mut windows = Vec::new();
             self.collect_windows_under(state.root, &mut windows);
@@ -1246,6 +1319,20 @@ impl LayoutSystem for BspLayoutSystem {
         let state = self.layouts.get(layout).expect("unknown BSP layout");
         let selected = self.tree.data.selection.current_selection(state.root);
         snapshot(self, state.root, selected)
+    }
+
+    fn prepare_layout(
+        &mut self,
+        layout: LayoutId,
+        screen: CGRect,
+        _constraints: &HashMap<WindowId, WindowLayoutConstraints>,
+        gaps: &crate::common::config::GapSettings,
+    ) {
+        self.layout_sizes.insert(layout, compute_tiling_area(screen, gaps).size);
+    }
+
+    fn set_layout_size_hint(&mut self, layout: LayoutId, size: CGSize) {
+        self.layout_sizes.entry(layout).or_insert(size);
     }
 
     fn calculate_layout(
