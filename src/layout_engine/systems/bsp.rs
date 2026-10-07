@@ -1969,6 +1969,22 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
+    fn window_fullscreen_kind(
+        &self,
+        layout: LayoutId,
+        wid: WindowId,
+    ) -> Option<crate::layout_engine::FloatingFullscreenKind> {
+        use crate::layout_engine::FloatingFullscreenKind;
+        let node = self.node_for_window_in_layout(layout, wid)?;
+        match self.kind.get(node) {
+            Some(NodeKind::Leaf { fullscreen: true, .. }) => Some(FloatingFullscreenKind::Full),
+            Some(NodeKind::Leaf {
+                fullscreen_within_gaps: true, ..
+            }) => Some(FloatingFullscreenKind::WithinGaps),
+            _ => None,
+        }
+    }
+
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction) {
         let Some(sel) = self.selection_of_layout(layout) else {
             return;

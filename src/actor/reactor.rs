@@ -6,6 +6,7 @@
 
 mod animation;
 mod autosave;
+mod borders;
 mod events;
 mod gesture;
 pub(crate) use crate::layout_engine::WorkspaceDropRequest as OverviewDrop;
@@ -47,6 +48,8 @@ mod SpaceEventHandler {
     }
 }
 
+#[cfg(test)]
+mod border_tests;
 #[cfg(test)]
 mod raise_storm_tests;
 #[cfg(test)]
@@ -454,6 +457,7 @@ pub struct Reactor {
     /// outcome has settled window membership.
     bindings_need_check: bool,
     autosave: autosave::Autosave,
+    borders: borders::BorderPublisher,
     #[cfg(test)]
     event_outcome_phase_trace: Vec<&'static str>,
     #[cfg(test)]
@@ -474,6 +478,7 @@ impl Reactor {
         broadcast_tx: BroadcastSender,
         menu_tx: menu_bar::Sender,
         stack_line_tx: stack_line::Sender,
+        border_tx: crate::actor::border::Sender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         one_space: bool,
         native_motion_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -494,6 +499,7 @@ impl Reactor {
         reactor.communication_manager.input_tx = Some(input_tx);
         reactor.menu_manager.menu_tx = Some(menu_tx);
         reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
+        reactor.communication_manager.border_tx = Some(border_tx);
         reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
         reactor.autosave.run_in_background(events_tx_clone.clone());
         let query_handle = ReactorQueryHandle::new(events_tx_clone.clone());
@@ -553,6 +559,7 @@ impl Reactor {
             communication_manager: managers::CommunicationManager {
                 input_tx: None,
                 stack_line_tx: None,
+                border_tx: None,
                 raise_manager_tx,
                 event_broadcaster: broadcast_tx,
                 wm_sender: None,
@@ -594,6 +601,7 @@ impl Reactor {
             in_flight_display_moves: HashMap::default(),
             bindings_need_check: false,
             autosave: autosave::Autosave::new(&config.settings.persistence, autosave_path()),
+            borders: borders::BorderPublisher::default(),
             #[cfg(test)]
             event_outcome_phase_trace: Vec::new(),
             #[cfg(test)]
@@ -1220,6 +1228,7 @@ impl Reactor {
                 self.apply_event_outcome(outcome);
                 self.apply_pending_display_bindings();
                 self.settle_global_workspaces();
+                self.publish_borders();
                 if may_make_ready
                     && self.startup_ready.is_some()
                     && let Some(space) = self.default_query_space()
@@ -2797,6 +2806,14 @@ impl Reactor {
             {
                 warn!(%error, "failed to update menu bar config");
             }
+            if let Some(tx) = &self.communication_manager.border_tx
+                && let Err(error) =
+                    tx.try_send(crate::actor::border::Event::ConfigUpdated(config.clone()))
+            {
+                warn!(%error, "failed to update window border config");
+            }
+            // Width, colors or enabling changed: resend every display.
+            self.borders.reset();
             if let Some(wm) = &self.communication_manager.wm_sender {
                 wm.send(crate::actor::wm_controller::WmEvent::ConfigUpdated(config));
             }

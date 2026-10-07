@@ -5,7 +5,7 @@ use crate::common::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
 use crate::sys::screen::SpaceId;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FloatingFullscreenKind {
+pub enum FloatingFullscreenKind {
     Full,
     WithinGaps,
 }

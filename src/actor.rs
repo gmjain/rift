@@ -4,6 +4,7 @@ use tracing::Span;
 use tracing_subscriber::registry::{LookupSpan, Registry};
 
 pub mod app;
+pub mod border;
 pub mod config;
 pub mod config_watcher;
 pub mod drag;

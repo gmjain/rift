@@ -143,7 +143,7 @@ fn stroke_for(display: CGRect, window: &BorderWindow, settings: &BorderSettings)
     } else {
         settings.width
     };
-    if !(width > 0.0) {
+    if width <= 0.0 || width.is_nan() {
         return None;
     }
     let color = match (fullscreen, settings.fullscreen_color()) {

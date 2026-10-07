@@ -2777,6 +2777,15 @@ impl LayoutEngine {
         self.workspaces[ws_id].layout_system.has_any_fullscreen_node(layout_id)
     }
 
+    /// The rift fullscreen command `wid` is under on `space`, floating or tiled.
+    pub fn fullscreen_kind(&self, space: SpaceId, wid: WindowId) -> Option<FloatingFullscreenKind> {
+        if let Some(kind) = self.floating.fullscreen_kind(wid) {
+            return Some(kind);
+        }
+        let (ws_id, layout_id) = self.workspaces.active_layout_for_space(space)?;
+        self.workspaces[ws_id].layout_system.window_fullscreen_kind(layout_id, wid)
+    }
+
     pub fn collect_group_containers(
         &mut self,
         space: SpaceId,
