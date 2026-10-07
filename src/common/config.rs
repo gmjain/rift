@@ -595,6 +595,11 @@ pub struct Settings {
     /// Enable hot-reloading of the config file when it changes
     #[serde(default = "yes")]
     pub hot_reload: bool,
+    /// WindowServer event-tap timeouts within 60 s before rift stops filtering
+    /// input (hotkeys inactive, nothing consumed) for a backoff of 5 s that
+    /// doubles up to 60 s. 0 disables the fallback.
+    #[serde(default = "default_event_tap_timeout_limit")]
+    pub event_tap_timeout_limit: u32,
 }
 
 /// The layout file (`restore_file()`) outside of explicit saves.
@@ -629,6 +634,8 @@ impl PersistenceSettings {
 }
 
 fn default_autosave_debounce_ms() -> u64 { 1000 }
+
+fn default_event_tap_timeout_limit() -> u32 { crate::sys::event_tap::DEFAULT_TIMEOUT_LIMIT }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]

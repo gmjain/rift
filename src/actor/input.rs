@@ -155,9 +155,12 @@ struct CallbackCtx {
     tap_generation: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Recovery {
     TapInvalidated(u64),
+    /// WindowServer disabled the tap and the trampoline re-enabled it; verify
+    /// and reconcile outside the callback.
+    TapDisabled(u64),
     NativeGestureHeld,
 }
 
@@ -294,6 +297,26 @@ impl Input {
         self.rebuild_event_tap_mask_if_needed(recovery_tx);
     }
 
+    /// Runs on the actor loop, never inside the tap callback: the enabled
+    /// query and the flags read are synchronous WindowServer calls.
+    fn on_tap_disabled(
+        &self,
+        generation: u64,
+        recovery_tx: &tokio::sync::mpsc::UnboundedSender<Recovery>,
+    ) {
+        if generation != self.tap_generation.get() {
+            debug!(generation, "Ignoring disable notice from a replaced event tap");
+            return;
+        }
+        let enabled = self.tap.borrow().as_ref().is_some_and(|tap| tap.is_enabled());
+        if enabled {
+            self.reconcile_after_tap_reenabled();
+        } else {
+            error!("Event tap did not re-enable; scheduling tap recreation");
+            self.rebuild_invalidated_event_tap(generation, recovery_tx);
+        }
+    }
+
     pub fn new(
         config: Config,
         events_tx: reactor::Sender,
@@ -323,6 +346,7 @@ impl Input {
             .unwrap_or(false);
         state.gesture_settings = super::gesture::Settings::new(&config);
         let gesture_control = super::gesture::Control::new(&config);
+        crate::sys::event_tap::set_timeout_limit(config.settings.event_tap_timeout_limit);
         let mouse_move_min_interval_ticks = mouse_move_sampling_profile(state.low_power_mode);
         let input = Input {
             events_tx,
@@ -396,6 +420,9 @@ impl Input {
                         Recovery::NativeGestureHeld => {}
                         Recovery::TapInvalidated(generation) => {
                             this.rebuild_invalidated_event_tap(generation, &recovery_tx);
+                        }
+                        Recovery::TapDisabled(generation) => {
+                            this.on_tap_disabled(generation, &recovery_tx);
                         }
                     }
                 }
@@ -533,6 +560,9 @@ impl Input {
                 if *self.binding_mode_specs.borrow() != new_config.binding_mode_specs {
                     self.install_binding_specs(new_config.binding_mode_specs.clone());
                 }
+                crate::sys::event_tap::set_timeout_limit(
+                    new_config.settings.event_tap_timeout_limit,
+                );
                 let cancel_captured_drag = state.captured_button.is_some()
                     && (!new_config.settings.drag_drop.enabled
                         || new_config.settings.drag_drop != state.mouse_settings);
@@ -1185,18 +1215,15 @@ unsafe extern "C-unwind" fn input_callback(
     }
 }
 
+/// Still inside the tap callback: only hand the recovery to the actor loop.
+/// Verifying the re-enable and reading live modifier state are WindowServer
+/// calls that must not run while WindowServer waits for this callback.
 unsafe extern "C-unwind" fn event_tap_reenabled(user_info: *mut std::ffi::c_void) {
     if user_info.is_null() {
         return;
     }
     let ctx = unsafe { &*(user_info as *const CallbackCtx) };
-    if std::panic::catch_unwind(AssertUnwindSafe(|| {
-        unsafe { &*ctx.this }.reconcile_after_tap_reenabled()
-    }))
-    .is_err()
-    {
-        error!("Panic while reconciling input state after event tap recovery");
-    }
+    let _ = ctx.recovery_tx.send(Recovery::TapDisabled(ctx.tap_generation));
 }
 
 unsafe extern "C-unwind" fn event_tap_invalidated(user_info: *mut std::ffi::c_void) {
@@ -2203,6 +2230,25 @@ mod tests {
             events_rx.try_recv().unwrap().1,
             Event::DragMotionPending(_)
         ));
+    }
+
+    #[test]
+    fn tap_reenable_hook_defers_recovery_to_the_actor_loop() {
+        let (input, _, mut events_rx) = input();
+        input.state.borrow_mut().pressed_keys.insert(KeyCode::KeyA);
+        let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = CallbackCtx {
+            this: &input,
+            recovery_tx,
+            tap_generation: 7,
+        };
+        unsafe { event_tap_reenabled((&mut ctx as *mut CallbackCtx).cast()) };
+        // Nothing was reconciled inside the callback: no WindowServer flags read, no
+        // gesture reset, no key cache clear. The actor loop does that later.
+        assert_eq!(recovery_rx.try_recv().unwrap(), Recovery::TapDisabled(7));
+        assert!(recovery_rx.try_recv().is_err());
+        assert!(input.state.borrow().pressed_keys.contains(&KeyCode::KeyA));
+        assert!(events_rx.try_recv().is_err());
     }
 
     #[test]
