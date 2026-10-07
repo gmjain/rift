@@ -9077,3 +9077,141 @@ fn global_workspaces_cycle_over_a_displays_own_and_the_unowned_workspaces() {
     assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
     assert_eq!(reactor.space_state.command_space, Some(left_space));
 }
+
+#[test]
+fn global_workspaces_switch_to_a_workspace_another_display_shows_by_focusing_it() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(
+        reactor.space_state.command_space,
+        Some(right_space),
+        "the display showing ws1 takes focus"
+    );
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(
+        active_workspace_index_of(&reactor, left_space),
+        Some(0),
+        "the left display must not open its own copy of ws1"
+    );
+
+    // A workspace no display owns opens on the display the user is on.
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(3));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(3));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+}
+
+#[test]
+fn global_workspaces_switch_to_a_workspace_parked_on_another_display_shows_it_there() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    // Park window 2 in ws2 on the left display: ws2 now lives there.
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(2),
+        follow: false,
+        window_id: Some(2),
+    });
+    apps.simulate_until_quiet(&mut reactor);
+    let left_workspaces = reactor.test_workspace_ids(left_space);
+    assert_eq!(
+        reactor.test_workspace_for_window(left_space, WindowId::new(1, 2)),
+        Some(left_workspaces[2])
+    );
+    focus_display_space(&mut reactor, right_space);
+
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(2));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(2));
+    assert_eq!(
+        active_workspace_index_of(&reactor, right_space),
+        Some(1),
+        "the right display must not open its own, empty copy of ws2"
+    );
+}
+
+#[test]
+fn global_workspaces_move_a_window_to_the_display_owning_the_workspace() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    let (moved, follows) = (WindowId::new(1, 2), WindowId::new(1, 1));
+
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Name("ws1".into()),
+        follow: false,
+        window_id: Some(2),
+    });
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(reactor.assigned_space_for_window_id(moved), Some(right_space));
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, moved),
+        Some(right_workspaces[1])
+    );
+    assert_eq!(reactor.assigned_space_for_window_id(follows), Some(left_space));
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+    let frame = reactor.state.windows.window(moved).unwrap().frame_monotonic;
+    assert!(
+        frame.origin.x >= 1000.,
+        "window should sit on the right display: {frame:?}"
+    );
+
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(1),
+        follow: true,
+        window_id: Some(1),
+    });
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(reactor.assigned_space_for_window_id(follows), Some(right_space));
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, follows),
+        Some(right_workspaces[1])
+    );
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+}
+
+#[test]
+fn global_workspaces_move_a_window_to_an_unowned_workspace_on_the_focused_display() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    let moved = WindowId::new(1, 2);
+    focus_display_space(&mut reactor, right_space);
+
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(3),
+        follow: false,
+        window_id: Some(2),
+    });
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(
+        reactor.assigned_space_for_window_id(moved),
+        Some(right_space),
+        "ws3 did not exist yet, so it opens on the focused display"
+    );
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, moved),
+        Some(right_workspaces[3])
+    );
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+
+    // The left display's own copy of ws3 stays empty, so ws3 now lives right.
+    focus_display_space(&mut reactor, left_space);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(3));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(3));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+}

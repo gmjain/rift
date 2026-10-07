@@ -23,8 +23,10 @@
 //! With `scope = "global"` every workspace has an owner, derived rather than
 //! configured: the display whose copy of it is showing or holds windows (a
 //! binding above forces the owner). A workspace no display owns does not exist
-//! yet, as in i3. Each display starts on a workspace no other display owns,
-//! and cycling on a display runs over its own and the unowned workspaces.
+//! yet, as in i3, and opens on the display the user is on. The routing above
+//! then applies to every workspace, which gives one shared set of workspaces
+//! over the per-display copies; cycling on a display runs over its own and the
+//! unowned workspaces.
 
 use tracing::warn;
 
@@ -207,10 +209,17 @@ impl Reactor {
         bound_screen(screens, binding)?.space
     }
 
-    /// The native space of the display among `screens` workspace `index` lives
-    /// on: the one it is bound to, or with global workspaces the one showing it
-    /// or holding its windows. `None` means the workspace is unowned: bound to a
+    /// The active native space of the display workspace `index` lives on: the
+    /// one it is bound to, or with global workspaces the one showing it or
+    /// holding its windows. `None` means the workspace is unowned: bound to a
     /// disconnected display, or not existing yet.
+    pub(crate) fn owner_space_for_workspace_index(&self, index: usize) -> Option<SpaceId> {
+        self.owner_space_among(&self.space_state.screens, index)
+            .filter(|space| self.is_space_active(*space))
+    }
+
+    /// `owner_space_for_workspace_index` among `screens`, which may be the
+    /// displays of a snapshot not yet applied.
     fn owner_space_among(&self, screens: &[ScreenInfo], index: usize) -> Option<SpaceId> {
         self.bound_space_among(screens, index).or_else(|| {
             self.has_global_workspaces()
@@ -255,18 +264,19 @@ impl Reactor {
         workspaces.workspace_ids(space).iter().position(|id| *id == workspace)
     }
 
-    /// Redirect commands that show, or move a window to, a workspace bound to
+    /// Redirect commands that show, or move a window to, a workspace owned by
     /// another display. `None` means the command takes the regular path.
     pub(crate) fn route_bound_workspace_command(
         &mut self,
         command: &LayoutCommand,
     ) -> Option<anyhow::Result<EventOutcome>> {
-        if !self.has_workspace_display_bindings() {
+        if !self.routes_workspace_commands() {
             return None;
         }
+        self.settle_global_workspaces();
         match command {
             LayoutCommand::SwitchToWorkspace(index) => {
-                let owner = self.bound_space_for_workspace_index(*index)?;
+                let owner = self.owner_space_for_workspace_index(*index)?;
                 (self.command_context_space() != Some(owner))
                     .then(|| self.switch_to_bound_workspace(owner, *index))
             }
@@ -278,22 +288,27 @@ impl Reactor {
                 let workspaces = self.layout_manager.layout_engine.workspaces();
                 let target = workspaces.resolve_workspace(source, workspace)?;
                 let index = self.workspace_ordinal(source, target)?;
-                let owner =
-                    self.bound_space_for_workspace_index(index).filter(|owner| *owner != source)?;
+                // An unowned workspace opens where the user is, which is not
+                // necessarily the display the window is on.
+                let owner = self.owner_space_for_workspace_index(index).or_else(|| {
+                    self.has_global_workspaces().then(|| self.command_context_space()).flatten()
+                });
+                let owner = owner.filter(|owner| *owner != source)?;
                 Some(self.move_window_to_bound_workspace(window, source, owner, index, *follow))
             }
             _ => None,
         }
     }
 
-    /// Picking a display's copy of a workspace bound elsewhere in the overview
+    /// Picking a display's copy of a workspace owned elsewhere in the overview
     /// switches to it on its owner instead.
     pub(crate) fn route_overview_workspace_selection(
         &mut self,
         space: SpaceId,
         index: usize,
     ) -> Option<anyhow::Result<EventOutcome>> {
-        let owner = self.bound_space_for_workspace_index(index).filter(|owner| *owner != space)?;
+        self.settle_global_workspaces();
+        let owner = self.owner_space_for_workspace_index(index).filter(|owner| *owner != space)?;
         Some(self.switch_to_bound_workspace(owner, index))
     }
 
