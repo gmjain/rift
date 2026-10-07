@@ -403,6 +403,74 @@ fn full_save_removes_stale_floating_frame_from_a_tiled_window() {
 }
 
 #[test]
+fn autosave_snapshot_keeps_a_tiled_windows_remembered_floating_frame() {
+    let mut engine = test_engine();
+    let mut window_store = WindowStore::default();
+    let space = SpaceId::new(126);
+    let size = CGSize::new(1200.0, 800.0);
+    let tiled = objc2_core_foundation::CGRect::new(
+        objc2_core_foundation::CGPoint::new(0.0, 0.0),
+        CGSize::new(600.0, 800.0),
+    );
+    let floated = objc2_core_foundation::CGRect::new(
+        objc2_core_foundation::CGPoint::new(200.0, 100.0),
+        CGSize::new(500.0, 400.0),
+    );
+    let window = WindowId::new(41, 9);
+    let _ = engine.handle_event(&mut window_store, LayoutEvent::SpaceExposed(space, size));
+    let workspace = engine.workspaces().active_workspace(space).unwrap();
+    window_store.insert_window(window, WindowState {
+        info: WindowInfo {
+            has_native_tabs: false,
+            is_standard: true,
+            is_root: true,
+            is_minimized: false,
+            is_resizable: true,
+            min_size: None,
+            max_size: None,
+            title: "Floated once".into(),
+            frame: tiled,
+            sys_id: Some(WindowServerId::new(4109)),
+            bundle_id: Some("com.example.tiled".into()),
+            path: None,
+            ax_role: None,
+            ax_subrole: None,
+        },
+        frame_monotonic: tiled,
+        is_manageable: true,
+        manage_override: None,
+    });
+    assert!(engine.workspaces.assign_window_to_workspace(
+        &mut window_store,
+        space,
+        window,
+        workspace,
+    ));
+    engine.add_window_to_layout(&mut window_store, space, window);
+    // The frame it had while floating; it goes back there when it floats again.
+    engine.floating_positions.store(space, workspace, window, floated);
+
+    let snapshot = engine.snapshot_layout_for_autosave(&window_store, Some(space)).unwrap();
+
+    assert_eq!(
+        engine.floating_positions.get(space, workspace, window),
+        Some(floated),
+        "an autosave must not change how the running layout behaves"
+    );
+    let loaded = LayoutEngine::deserialize_from_str(snapshot.contents()).unwrap();
+    assert_eq!(
+        loaded.restored_location_for_window(window),
+        Some((space, workspace))
+    );
+    assert_eq!(
+        loaded.floating_positions.get(space, workspace, window),
+        None,
+        "loading heals the file: a tiled window has no floating frame"
+    );
+    assert!(!loaded.floating.is_floating(window));
+}
+
+#[test]
 fn load_does_not_arm_locationless_fingerprints() {
     let mut engine = test_engine();
     let orphan = WindowId::new(42, 8);
