@@ -453,6 +453,9 @@ impl LayoutManager {
                 any_frame_changed |=
                     AnimationManager::instant_layout(reactor, space, &layout, skip_wid);
             } else {
+                // The border overlay follows the windows with the same motion.
+                let motion = AnimationManager::layout_animation(reactor, space, is_resize);
+                reactor.borders.note_motion(space, motion);
                 any_frame_changed |=
                     AnimationManager::animate_layout(reactor, space, &layout, is_resize, skip_wid);
             }

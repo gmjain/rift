@@ -7,7 +7,36 @@
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
 use crate::actor::app::WindowId;
-use crate::common::config::{BorderSettings, Color};
+use crate::common::config::{BorderSettings, Color, Settings};
+
+/// How an overlay moves its strokes to new frames: in the compositor, over the
+/// same time and curve as rift's own window animation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BorderAnimation {
+    pub duration: f64,
+}
+
+impl BorderAnimation {
+    /// Cubic-bezier control points approximating rift's ease-in-out-circ
+    /// window easing, for a `CAMediaTimingFunction`.
+    pub const CONTROL_POINTS: [f32; 4] = [0.85, 0.0, 0.15, 1.0];
+
+    /// The animation a layout pass runs, under the same conditions rift uses
+    /// to animate the windows themselves (`AnimationManager::animate_layout`).
+    pub fn for_layout(
+        settings: &Settings,
+        layout_animate: Option<bool>,
+        is_resize: bool,
+        low_power: bool,
+    ) -> Option<Self> {
+        let animate = !is_resize
+            && layout_animate.unwrap_or(settings.animate)
+            && !(layout_animate.is_none() && low_power);
+        (animate && settings.animation_duration > 0.0).then_some(Self {
+            duration: settings.animation_duration,
+        })
+    }
+}
 
 /// Which rift fullscreen command a window is under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -363,6 +392,40 @@ mod tests {
         zero.fullscreen = None;
         let shown = window(2, rect(1008.0, 8.0, 984.0, 784.0));
         assert!(compute(DISPLAY, &[shown], &zero).is_empty());
+    }
+
+    #[test]
+    fn layout_animation_follows_rift_window_animation_rules() {
+        let mut settings = crate::common::config::Config::default().settings;
+        settings.animate = true;
+        settings.animation_duration = 0.25;
+        let on = Some(BorderAnimation { duration: 0.25 });
+
+        assert_eq!(BorderAnimation::for_layout(&settings, None, false, false), on);
+        // Resizes and low power mode are never animated.
+        assert_eq!(BorderAnimation::for_layout(&settings, None, true, false), None);
+        assert_eq!(BorderAnimation::for_layout(&settings, None, false, true), None);
+        // A layout with its own setting ignores both the global one and low power.
+        assert_eq!(
+            BorderAnimation::for_layout(&settings, Some(true), false, true),
+            on
+        );
+        assert_eq!(
+            BorderAnimation::for_layout(&settings, Some(false), false, false),
+            None
+        );
+        settings.animate = false;
+        assert_eq!(BorderAnimation::for_layout(&settings, None, false, false), None);
+        assert_eq!(
+            BorderAnimation::for_layout(&settings, Some(true), false, false),
+            on
+        );
+        // Nothing to animate over zero time.
+        settings.animation_duration = 0.0;
+        assert_eq!(
+            BorderAnimation::for_layout(&settings, Some(true), false, false),
+            None
+        );
     }
 
     #[test]
