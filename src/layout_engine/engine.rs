@@ -3316,6 +3316,24 @@ impl LayoutEngine {
         self.workspaces.ensure_layouts_for_size(space, screen_size);
     }
 
+    /// `CreateWorkspace` with global workspaces: one new workspace on every
+    /// native space.
+    pub fn create_workspace_everywhere(&mut self) -> bool {
+        match self.workspaces.create_workspace_on_every_space() {
+            Ok(_) => {
+                for space in self.workspaces.initialized_spaces() {
+                    self.sync_scrolling_widths_for_space(space);
+                    self.broadcast_workspace_changed(space);
+                }
+                true
+            }
+            Err(error) => {
+                warn!("Failed to create new workspace: {:?}", error);
+                false
+            }
+        }
+    }
+
     /// Move a workspace from one display's copy to another display's empty copy
     /// at the same position, keeping its layout: the windows, tiled and parked,
     /// change assignment, the layout trees and focus memory move with them, and

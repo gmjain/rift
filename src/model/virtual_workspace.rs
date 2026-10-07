@@ -550,6 +550,28 @@ impl WorkspaceStore {
     /// The back-and-forth target shared by all displays, by position.
     pub(crate) fn global_last_workspace(&self) -> Option<usize> { self.global_last_workspace }
 
+    /// Append a workspace with one new name to every native space, so that
+    /// shared workspaces keep the same position everywhere. Nothing is created
+    /// when a space is at the limit.
+    pub(crate) fn create_workspace_on_every_space(&mut self) -> Result<String, WorkspaceError> {
+        let spaces = self.initialized_spaces();
+        if let Some(space) = spaces
+            .iter()
+            .find(|space| self.workspace_ids(**space).len() >= self.max_workspaces)
+        {
+            return Err(WorkspaceError::InconsistentState(format!(
+                "Maximum workspace limit ({}) reached for space {:?}",
+                self.max_workspaces, space
+            )));
+        }
+        let name = format!("Workspace {}", self.workspace_counter);
+        self.workspace_counter += 1;
+        for space in spaces {
+            self.create_workspace(space, Some(name.clone()))?;
+        }
+        Ok(name)
+    }
+
     /// Forget where workspace `index` of `space` lived before its display went
     /// away: the user put it somewhere on purpose, or it is back.
     pub(crate) fn clear_home_display(&mut self, space: SpaceId, index: usize) {

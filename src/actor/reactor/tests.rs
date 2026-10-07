@@ -9822,3 +9822,42 @@ fn global_workspaces_menu_bar_lists_each_display_its_own_and_the_unowned_workspa
     );
     assert_eq!(listed(right_space), vec![(1, true), (2, false), (3, false)]);
 }
+
+#[test]
+fn global_workspaces_create_workspace_adds_it_to_every_display() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+
+    reactor.handle_test_layout_command(LayoutCommand::CreateWorkspace);
+    apps.simulate_until_quiet(&mut reactor);
+
+    let names = |reactor: &mut Reactor, space| -> Vec<String> {
+        reactor
+            .layout_manager
+            .layout_engine
+            .workspaces_mut()
+            .list_workspaces(space)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    };
+    let left_names = names(&mut reactor, left_space);
+    assert_eq!(left_names.len(), 5, "{left_names:?}");
+    assert_eq!(names(&mut reactor, right_space), left_names);
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+
+    // The new workspace is shared like the others: it opens where the user
+    // is, and the other display then skips it when cycling.
+    focus_display_space(&mut reactor, right_space);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(4));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(4));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    focus_display_space(&mut reactor, left_space);
+    reactor.handle_test_layout_command(LayoutCommand::PrevWorkspace(None));
+    assert_eq!(
+        active_workspace_index_of(&reactor, left_space),
+        Some(3),
+        "ws4 shows on the right display, ws1 is free again"
+    );
+}

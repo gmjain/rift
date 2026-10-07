@@ -118,9 +118,9 @@ impl Reactor {
             return self.configured_display_bindings_for(screens);
         }
         let settings = &self.config.virtual_workspaces;
-        let count = settings.default_workspace_count.max(1);
         let default = settings.default_workspace;
         let workspaces = self.layout_manager.layout_engine.workspaces();
+        let count = workspaces.workspace_count();
         let mut owners: Vec<Option<SpaceId>> =
             (0..count).map(|index| self.owner_space_among(screens, index)).collect();
         let mut bindings = Vec::with_capacity(screens.len());
@@ -371,6 +371,22 @@ impl Reactor {
                     None => Ok(EventOutcome::no_change()),
                 })
             }
+            LayoutCommand::CreateWorkspace if self.has_global_workspaces() => {
+                // Every display's copy grows, so positions stay aligned.
+                let here = self.command_context_space();
+                let created = self.layout_manager.layout_engine.create_workspace_everywhere();
+                Some(Ok(if created {
+                    EventOutcome::layout_changed(false).with_layout_response(
+                        crate::layout_engine::EventResponse {
+                            changed: true,
+                            ..Default::default()
+                        },
+                        here,
+                    )
+                } else {
+                    EventOutcome::no_change()
+                }))
+            }
             LayoutCommand::MoveWindowToWorkspace { workspace, follow, window_id } => {
                 let window = self.resolve_command_window(*window_id)?;
                 let source = self
@@ -393,12 +409,10 @@ impl Reactor {
 
     /// The shared back-and-forth target, if it is a workspace that exists.
     fn global_back_and_forth_target(&self) -> Option<usize> {
-        let count = self.config.virtual_workspaces.default_workspace_count.max(1);
-        self.layout_manager
-            .layout_engine
-            .workspaces()
+        let workspaces = self.layout_manager.layout_engine.workspaces();
+        workspaces
             .global_last_workspace()
-            .filter(|index| *index < count)
+            .filter(|index| *index < workspaces.workspace_count())
     }
 
     /// Show workspace `index` on its owner, or on the display the user is on.
