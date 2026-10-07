@@ -3361,8 +3361,10 @@ impl Reactor {
         if should_force_refresh_layout {
             outcome = outcome.with_arrange_passes(1);
         }
-        if display_set_changed || should_force_refresh_layout {
-            // A display joined, left or moved.
+        if display_set_changed || should_force_refresh_layout || self.has_global_workspaces() {
+            // A display joined, left or moved. With global workspaces any full
+            // snapshot (a restored layout, a display back from fullscreen) may
+            // show two displays the same workspace.
             self.check_display_bindings_later();
         }
         Ok(outcome)
