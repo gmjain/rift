@@ -19,6 +19,7 @@ use rift_wm::actor::spaces::SpacesActor;
 use rift_wm::actor::stack_line::StackLine;
 use rift_wm::actor::window_notify as window_notify_actor;
 use rift_wm::actor::wm_controller::{self, WmController};
+use rift_wm::actor::workspace_hud::WorkspaceHud;
 use rift_wm::common::config::{Config, config_file, restore_file};
 use rift_wm::common::log;
 use rift_wm::common::util::execute_startup_commands;
@@ -209,6 +210,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (menu_tx, menu_rx) = rift_wm::actor::channel();
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
     let (border_tx, border_rx) = rift_wm::actor::channel();
+    let (workspace_hud_tx, workspace_hud_rx) = rift_wm::actor::channel();
     let (wnd_tx, wnd_rx) = rift_wm::actor::channel();
     let window_tx_store = WindowTxStore::new();
     let native_motion_active: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
@@ -221,6 +223,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         menu_tx.clone(),
         stack_line_tx.clone(),
         border_tx,
+        workspace_hud_tx,
         Some((wnd_tx.clone(), window_tx_store.clone())),
         opt.one,
         native_motion_active.clone(),
@@ -333,6 +336,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         stack_line_hit_rects.clone(),
     );
     let border = Border::new(config.clone(), border_rx, mtm);
+    let workspace_hud = WorkspaceHud::new(&config, workspace_hud_rx, mtm);
 
     let mission_control = mc_channel.map(|(tx, rx)| {
         MissionControlActor::new(
@@ -393,6 +397,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             supervise("menu", menu.run()),
             supervise("stack_line", stack_line.run()),
             supervise("border", border.run()),
+            supervise("workspace_hud", workspace_hud.run()),
             supervise("window_notify", wn_actor.run()),
             supervise("mc_native", mission_control_native.run()),
             async move {
