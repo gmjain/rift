@@ -18,6 +18,7 @@ mod replay;
 pub mod transaction_manager;
 mod utils;
 mod workspace_bindings;
+mod workspace_hud;
 
 #[cfg(test)]
 mod testing;
@@ -57,6 +58,8 @@ mod floating_on_top_tests;
 mod raise_storm_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod workspace_hud_tests;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -464,6 +467,8 @@ pub struct Reactor {
     bindings_need_check: bool,
     autosave: autosave::Autosave,
     borders: borders::BorderPublisher,
+    /// The displays the workspace HUD actor was last told about.
+    hud_displays: Vec<crate::model::workspace_hud::HudDisplay>,
     #[cfg(test)]
     event_outcome_phase_trace: Vec<&'static str>,
     #[cfg(test)]
@@ -485,6 +490,7 @@ impl Reactor {
         menu_tx: menu_bar::Sender,
         stack_line_tx: stack_line::Sender,
         border_tx: crate::actor::border::Sender,
+        workspace_hud_tx: crate::actor::workspace_hud::Sender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         one_space: bool,
         native_motion_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -506,6 +512,7 @@ impl Reactor {
         reactor.menu_manager.menu_tx = Some(menu_tx);
         reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
         reactor.communication_manager.border_tx = Some(border_tx);
+        reactor.communication_manager.workspace_hud_tx = Some(workspace_hud_tx);
         reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
         reactor.autosave.run_in_background(events_tx_clone.clone());
         let query_handle = ReactorQueryHandle::new(events_tx_clone.clone());
@@ -566,6 +573,7 @@ impl Reactor {
                 input_tx: None,
                 stack_line_tx: None,
                 border_tx: None,
+                workspace_hud_tx: None,
                 raise_manager_tx,
                 event_broadcaster: broadcast_tx,
                 wm_sender: None,
@@ -609,6 +617,7 @@ impl Reactor {
             bindings_need_check: false,
             autosave: autosave::Autosave::new(&config.settings.persistence, autosave_path()),
             borders: borders::BorderPublisher::default(),
+            hud_displays: Vec::new(),
             #[cfg(test)]
             event_outcome_phase_trace: Vec::new(),
             #[cfg(test)]
@@ -1228,8 +1237,14 @@ impl Reactor {
             self.borders.request_reorder();
         }
         let previously_focused_window = self.main_window();
+        // A user action that may switch workspaces: note what is showing, so
+        // the switch it decides can be announced before any focus/raise work.
+        let hud_probe = self.probe_workspace_hud(&event);
         match self.dispatch_workflow(event) {
             Ok(mut outcome) => {
+                if let Some(probe) = hud_probe {
+                    self.announce_workspace_switch(probe);
+                }
                 let focused_window = self.main_window();
                 if focused_window != previously_focused_window
                     && let Some(focused_window) = focused_window
@@ -1240,6 +1255,7 @@ impl Reactor {
                 self.apply_pending_display_bindings();
                 self.settle_global_workspaces();
                 self.publish_borders();
+                self.publish_hud_displays();
                 if may_make_ready
                     && self.startup_ready.is_some()
                     && let Some(space) = self.default_query_space()
@@ -2833,6 +2849,12 @@ impl Reactor {
                     tx.try_send(crate::actor::border::Event::ConfigUpdated(config.clone()))
             {
                 warn!(%error, "failed to update window border config");
+            }
+            if let Some(tx) = &self.communication_manager.workspace_hud_tx
+                && let Err(error) =
+                    tx.try_send(crate::actor::workspace_hud::Event::ConfigUpdated(config.clone()))
+            {
+                warn!(%error, "failed to update workspace HUD config");
             }
             // Width, colors or enabling changed: resend every display.
             self.borders.reset();

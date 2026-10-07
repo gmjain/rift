@@ -21,6 +21,7 @@ pub mod spaces;
 pub mod stack_line;
 pub mod window_notify;
 pub mod wm_controller;
+pub mod workspace_hud;
 
 /// Deepest span ancestry an actor message carries to its receiver.
 ///
