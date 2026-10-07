@@ -27,6 +27,7 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
 | 10 | menu bar: dashed frame around a workspace with a fullscreen window | `e8b0b43`, `adbe92a` | done |
 | 11 | native window borders + dimming (`[settings.ui.border]`, `[settings.ui.dim]`) | `b17bd6e` to `7171c2c` (6) | done, off by default |
 | 12 | floating windows above tiled ones (`[settings] floating_windows_on_top`) | `ca789bf`, `d63800c` | done, off by default |
+| 13 | input-freeze fix: event tap on its own thread, non-blocking timeout handler, tap breaker (`[settings] event_tap_timeout_limit`) | `b03e557`, `3bb738a` | done |
 
 - Rows 1-4 are the former local branch `wms/fixes` (base 3a99afa, v0.6.7), rebased onto
   upstream 0.6.8. Root-cause write-ups: `wms/docs/incidents/2026-10-05-rift-*.md`.
@@ -46,6 +47,13 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
 - Row 10 has no config key. Rows 11-12 change nothing until enabled; design and limits:
   `wms/docs/rift-borders.md`. Review of rows 8-12: `wms/docs/rift-fork-review-2026-10-06.md`
   (second pass).
+- Row 13 fixes the 2026-10-06 input freeze (`wms/docs/incidents/2026-10-06-rift-input-freeze.md`):
+  the HID tap runs on a user-interactive `event-tap` thread whose callback only reads shared
+  in-memory state (1 ms lock wait, else pass-through, logged); cursor show/warp and stack-line
+  occlusion move to the input actor; the timeout handler only re-enables the tap; after
+  `event_tap_timeout_limit` (default 3) timeouts in 60 s input passes through unfiltered for
+  5-60 s. Active by default (hotkey semantics unchanged); upstream-worthy. Review:
+  `wms/docs/rift-fork-review-2026-10-06.md` (third pass).
 - Status values: planned, in progress, done (on `main`), live (deployed), upstreamed, dropped.
 - Update this table in the same commit that changes a patch's status.
 
