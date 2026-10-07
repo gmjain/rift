@@ -10,8 +10,9 @@ use super::testing::*;
 use super::*;
 use crate::actor::app::pid_t;
 use crate::actor::border::{DisplaySnapshot, Event as BorderEvent};
+use crate::common::config::LayoutMode;
 use crate::layout_engine::LayoutCommand;
-use crate::model::border::FullscreenKind;
+use crate::model::border::{BorderAnimation, FullscreenKind};
 use crate::sys::geometry::SameAs;
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
@@ -268,6 +269,45 @@ fn config_reload_toggles_publishing_and_resends_every_display() {
     assert!(matches!(events[0], BorderEvent::ConfigUpdated(_)));
     focus(&mut reactor, WindowId::new(1, 1), space);
     assert!(drain(&mut rx).is_empty());
+}
+
+#[test]
+fn updates_carry_the_layout_pass_animation_and_focus_changes_none() {
+    let (mut apps, mut reactor, mut rx, space, _screen) = one_display();
+    assert!(!reactor.config.settings.animate, "test reactors do not animate");
+
+    // Windows jump: so do their strokes.
+    reactor.handle_test_layout_command(LayoutCommand::ToggleOrientation);
+    apps.simulate_until_quiet(&mut reactor);
+    let snapshots = updates(drain(&mut rx));
+    assert!(!snapshots.is_empty());
+    assert!(snapshots.iter().all(|snapshot| snapshot.animation.is_none()));
+
+    // Focus alone moves no window: the restroke is instant.
+    focus(&mut reactor, WindowId::new(1, 1), space);
+    let _ = drain(&mut rx);
+    reactor.handle_event(Event::WindowServerFocusChanged(WindowId::new(1, 2), space));
+    let snapshots = updates(drain(&mut rx));
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert_eq!(snapshots[0].animation, None);
+
+    // A scrolling workspace animates regardless of the global switch (and of
+    // low power mode), so the layout pass that re-tiles it carries the motion.
+    reactor.config.settings.animation_duration = 0.2;
+    reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+        workspace: None,
+        mode: LayoutMode::Scrolling,
+    });
+    apps.simulate_until_quiet(&mut reactor);
+    let snapshots = updates(drain(&mut rx));
+    assert!(!snapshots.is_empty());
+    for snapshot in &snapshots {
+        assert_eq!(
+            snapshot.animation,
+            Some(BorderAnimation { duration: 0.2 }),
+            "{snapshot:?}"
+        );
+    }
 }
 
 #[test]

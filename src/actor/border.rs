@@ -12,7 +12,7 @@ use tracing::{debug, instrument, warn};
 use crate::actor;
 use crate::common::collections::HashMap;
 use crate::common::config::Config;
-use crate::model::border::{self, BorderWindow};
+use crate::model::border::{self, BorderAnimation, BorderWindow};
 use crate::sys::screen::SpaceId;
 use crate::ui::border::DisplayOverlay;
 
@@ -27,6 +27,8 @@ pub struct DisplaySnapshot {
     pub backing_scale: f64,
     /// Windows of the active workspace, sorted by id.
     pub windows: Vec<BorderWindow>,
+    /// How the windows move to these frames; `None` when they jump.
+    pub animation: Option<BorderAnimation>,
 }
 
 #[derive(Debug)]
@@ -78,9 +80,10 @@ impl Border {
         match event {
             Event::DisplayUpdated(snapshot) => {
                 let uuid = snapshot.display_uuid.clone();
+                let animation = snapshot.animation;
                 self.snapshots.insert(uuid.clone(), snapshot);
                 if self.is_enabled() {
-                    self.render(&uuid);
+                    self.render(&uuid, animation);
                 }
             }
             Event::DisplayCleared(uuid) => {
@@ -101,11 +104,11 @@ impl Border {
         }
         let uuids: Vec<String> = self.snapshots.keys().cloned().collect();
         for uuid in uuids {
-            self.render(&uuid);
+            self.render(&uuid, None);
         }
     }
 
-    fn render(&mut self, uuid: &str) {
+    fn render(&mut self, uuid: &str, animation: Option<BorderAnimation>) {
         let Some(snapshot) = self.snapshots.get(uuid) else {
             return;
         };
@@ -132,7 +135,7 @@ impl Border {
         let Some(overlay) = self.overlays.get_mut(uuid) else {
             return;
         };
-        if let Err(error) = overlay.apply(&borders) {
+        if let Err(error) = overlay.apply(&borders, animation) {
             warn!(?error, uuid, "failed to update window border overlay");
             self.overlays.remove(uuid);
         }

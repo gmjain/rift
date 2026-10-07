@@ -12,16 +12,32 @@ use crate::actor::app::WindowId;
 use crate::actor::border::{self, DisplaySnapshot};
 use crate::common::collections::{HashMap, HashSet};
 use crate::layout_engine::{FloatingFullscreenKind, LayoutSystem};
-use crate::model::border::{BorderWindow, FullscreenKind};
+use crate::model::border::{BorderAnimation, BorderWindow, FullscreenKind};
+use crate::sys::screen::SpaceId;
 
 #[derive(Default)]
 pub(super) struct BorderPublisher {
+    /// What each display was last told, without the animation.
     last: HashMap<String, DisplaySnapshot>,
+    /// Animations started by this event's layout passes, per space.
+    motion: HashMap<SpaceId, BorderAnimation>,
 }
 
 impl BorderPublisher {
     /// Forget what was sent, so the next publish resends every display.
     pub(super) fn reset(&mut self) { self.last.clear(); }
+
+    /// Record how a layout pass on `space` moves its windows.
+    pub(super) fn note_motion(&mut self, space: SpaceId, motion: Option<BorderAnimation>) {
+        match motion {
+            Some(animation) => {
+                self.motion.insert(space, animation);
+            }
+            None => {
+                self.motion.remove(&space);
+            }
+        }
+    }
 }
 
 impl Reactor {
@@ -34,12 +50,14 @@ impl Reactor {
             return;
         };
         let mut present: HashSet<String> = HashSet::default();
-        for snapshot in self.border_snapshots() {
+        let motion = std::mem::take(&mut self.borders.motion);
+        for mut snapshot in self.border_snapshots() {
             present.insert(snapshot.display_uuid.clone());
             if self.borders.last.get(&snapshot.display_uuid) == Some(&snapshot) {
                 continue;
             }
             self.borders.last.insert(snapshot.display_uuid.clone(), snapshot.clone());
+            snapshot.animation = motion.get(&snapshot.space).copied();
             tx.send(border::Event::DisplayUpdated(snapshot));
         }
         let gone: Vec<String> = self
@@ -118,6 +136,7 @@ impl Reactor {
                 frame: screen.frame,
                 backing_scale: screen.backing_scale,
                 windows,
+                animation: None,
             });
         }
         snapshots

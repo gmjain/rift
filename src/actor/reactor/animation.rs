@@ -964,6 +964,35 @@ impl AnimationManager {
         delay
     }
 
+    /// Whether a layout pass on `space` animates the windows to their frames.
+    fn layout_animates(reactor: &Reactor, space: SpaceId, is_resize: bool) -> bool {
+        let setting = reactor.layout_manager.layout_engine.layout_specific_animate_settings(space);
+        !is_resize
+            && setting.unwrap_or(reactor.config.settings.animate)
+            && !(setting.is_none() && power::is_low_power_mode_enabled())
+    }
+
+    /// The border overlay animation matching this layout pass, if it animates.
+    pub fn layout_animation(
+        reactor: &Reactor,
+        space: SpaceId,
+        is_resize: bool,
+    ) -> Option<crate::model::border::BorderAnimation> {
+        let setting = reactor.layout_manager.layout_engine.layout_specific_animate_settings(space);
+        let animation = crate::model::border::BorderAnimation::for_layout(
+            &reactor.config.settings,
+            setting,
+            is_resize,
+            power::is_low_power_mode_enabled(),
+        );
+        debug_assert_eq!(
+            animation.is_some(),
+            Self::layout_animates(reactor, space, is_resize)
+                && reactor.config.settings.animation_duration > 0.0
+        );
+        animation
+    }
+
     pub fn animate_layout(
         reactor: &mut Reactor,
         space: SpaceId,
@@ -972,10 +1001,7 @@ impl AnimationManager {
         skip_wid: Option<WindowId>,
     ) -> bool {
         reactor.retire_presentations();
-        let setting = reactor.layout_manager.layout_engine.layout_specific_animate_settings(space);
-        let animate_camera = !is_resize
-            && setting.unwrap_or(reactor.config.settings.animate)
-            && !(setting.is_none() && power::is_low_power_mode_enabled());
+        let animate_camera = Self::layout_animates(reactor, space, is_resize);
         let presentation = reactor.present_camera(space, animate_camera, None, skip_wid);
         let camera = presentation.is_some();
         let presented = presentation.unwrap_or_default();
@@ -1507,6 +1533,41 @@ mod tests {
 
     fn rect(origin_x: f64, origin_y: f64, width: f64, height: f64) -> CGRect {
         CGRect::new(CGPoint::new(origin_x, origin_y), CGSize::new(width, height))
+    }
+
+    /// y of the cubic bezier (0,0)-(c1)-(c2)-(1,1) at the parameter whose x is
+    /// `x`, i.e. the curve Core Animation drives with these control points.
+    fn bezier_y_at(points: [f32; 4], x: f64) -> f64 {
+        let [c1x, c1y, c2x, c2y] = points.map(f64::from);
+        let coord = |a: f64, b: f64, t: f64| {
+            3.0 * (1.0 - t) * (1.0 - t) * t * a + 3.0 * (1.0 - t) * t * t * b + t * t * t
+        };
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..60 {
+            let mid = (lo + hi) / 2.0;
+            if coord(c1x, c2x, mid) < x {
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+        coord(c1y, c2y, (lo + hi) / 2.0)
+    }
+
+    #[test]
+    fn border_animation_curve_matches_window_easing() {
+        let points = crate::model::border::BorderAnimation::CONTROL_POINTS;
+        assert!(bezier_y_at(points, 0.0).abs() < 1e-9);
+        assert!((bezier_y_at(points, 1.0) - 1.0).abs() < 1e-9);
+        assert!((bezier_y_at(points, 0.5) - ease(0.5)).abs() < 1e-3);
+        for step in 1..20 {
+            let t = step as f64 / 20.0;
+            let difference = (bezier_y_at(points, t) - ease(t)).abs();
+            assert!(
+                difference < 0.05,
+                "t={t}: bezier differs from ease by {difference}"
+            );
+        }
     }
 
     fn empty_animation() -> Animation {

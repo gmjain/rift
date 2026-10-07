@@ -4,23 +4,32 @@
 //! by *level* just above the desktop so every app window is above it without a
 //! single per-window ordering call. The strokes are a layer tree bound to the
 //! compositor (`WindowSurface`): one `CAShapeLayer` per stroked window holding
-//! an even-odd ring path, all changed in one `CATransaction` per update. The
-//! window in `toggle_fullscreen` leaves no gap to draw in, so its stroke goes
-//! inline into a second, floating-level overlay that exists only while needed.
+//! an even-odd ring path, all changed in one `CATransaction` per update. When
+//! rift animates the windows, each changed path gets one explicit
+//! `CABasicAnimation` with rift's duration and easing (shape paths never
+//! animate implicitly), so the compositor moves the strokes with the windows
+//! without per-tick work in rift. The window in `toggle_fullscreen` leaves no
+//! gap to draw in, so its stroke goes inline into a second, floating-level
+//! overlay that exists only while needed.
 
 use std::ptr;
 
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect};
 use objc2_core_graphics::{
-    CGColor, CGMutablePath, kCGDesktopIconWindowLevel, kCGFloatingWindowLevel,
+    CGColor, CGMutablePath, CGPath, kCGDesktopIconWindowLevel, kCGFloatingWindowLevel,
 };
-use objc2_quartz_core::{CALayer, CAShapeLayer, CATransaction, kCAFillRuleEvenOdd};
+use objc2_foundation::NSString;
+use objc2_quartz_core::{
+    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction, CAShapeLayer, CATransaction,
+    kCAFillRuleEvenOdd,
+};
 
 use crate::actor::app::WindowId;
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::Color;
-use crate::model::border::{DisplayBorders, Ring};
+use crate::model::border::{BorderAnimation, DisplayBorders, Ring};
 use crate::sys::cgs_window::{CgsWindow, CgsWindowError};
 use crate::sys::screen::SpaceId;
 use crate::sys::skylight::SLSWindowTags;
@@ -61,13 +70,18 @@ impl DisplayOverlay {
 
     /// Replace the strokes: one transaction for the below overlay, and the
     /// inline overlay created or dropped as the fullscreen exception comes and
-    /// goes.
-    pub fn apply(&mut self, borders: &DisplayBorders) -> Result<(), CgsWindowError> {
+    /// goes. With `animation`, strokes that move do so over that motion.
+    pub fn apply(
+        &mut self,
+        borders: &DisplayBorders,
+        animation: Option<BorderAnimation>,
+    ) -> Result<(), CgsWindowError> {
         self.below.apply(
             borders
                 .below
                 .iter()
                 .map(|stroke| (stroke.id, stroke.outside_ring(), stroke.color)),
+            animation,
         );
         match &borders.inline {
             Some(stroke) => {
@@ -75,7 +89,10 @@ impl DisplayOverlay {
                     self.inline = Some(Overlay::new(self.frame, self.scale, INLINE_LEVEL)?);
                 }
                 if let Some(inline) = &mut self.inline {
-                    inline.apply(std::iter::once((stroke.id, stroke.inline_ring(), stroke.color)));
+                    inline.apply(
+                        std::iter::once((stroke.id, stroke.inline_ring(), stroke.color)),
+                        animation,
+                    );
                 }
             }
             None => self.inline = None,
@@ -127,16 +144,23 @@ impl Overlay {
         })
     }
 
-    fn apply(&mut self, strokes: impl Iterator<Item = (WindowId, Ring, Color)>) {
+    fn apply(
+        &mut self,
+        strokes: impl Iterator<Item = (WindowId, Ring, Color)>,
+        animation: Option<BorderAnimation>,
+    ) {
         let height = self.bounds.size.height;
         let bounds = self.bounds;
         let root = &self.root;
         let layers = &mut self.layers;
         let mut kept: HashSet<WindowId> = HashSet::default();
 
+        // Explicit animations below still run; this only stops Core Animation
+        // from implicitly animating colors and new layers.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         for (id, ring, color) in strokes {
+            let path = ring_path(&ring, height);
             let layer = layers.entry(id).or_insert_with(|| {
                 let layer = CAShapeLayer::layer();
                 layer.setFrame(bounds);
@@ -146,7 +170,13 @@ impl Overlay {
                 layer
             });
             layer.setFillColor(Some(&cg_color(color)));
-            layer.setPath(Some(&ring_path(&ring, height)));
+            if let Some(animation) = animation
+                && let Some(previous) = layer.path()
+                && !CGPath::equal_to_path(Some(&previous), Some(&path))
+            {
+                animate_path(layer, &previous, &path, animation);
+            }
+            layer.setPath(Some(&path));
             kept.insert(id);
         }
         layers.retain(|id, layer| {
@@ -170,6 +200,39 @@ impl Drop for Overlay {
 
 fn cg_color(color: Color) -> CFRetained<CGColor> {
     CGColor::new_generic_rgb(color.r, color.g, color.b, color.a)
+}
+
+/// Move `layer`'s ring from `previous` to `next` in the compositor, over the
+/// same duration and curve as rift moves the window.
+fn animate_path(
+    layer: &CAShapeLayer,
+    previous: &CGPath,
+    next: &CGMutablePath,
+    animation: BorderAnimation,
+) {
+    // Start from where the ring is on screen: a change that lands while an
+    // earlier one is still in flight continues from there instead of jumping
+    // back to the old frame.
+    let presented: Option<Retained<CGPath>> = unsafe { layer.presentationLayer() }
+        .and_then(|presented| presented.downcast::<CAShapeLayer>().ok())
+        .and_then(|presented| presented.path());
+    let from: &CGPath = presented.as_deref().unwrap_or(previous);
+
+    let key = NSString::from_str("path");
+    let motion = CABasicAnimation::animationWithKeyPath(Some(&key));
+    let from_value: &AnyObject = from.as_ref();
+    let to_value: &AnyObject = (**next).as_ref();
+    unsafe {
+        motion.setFromValue(Some(from_value));
+        motion.setToValue(Some(to_value));
+    }
+    motion.setDuration(animation.duration);
+    let [c1x, c1y, c2x, c2y] = BorderAnimation::CONTROL_POINTS;
+    motion.setTimingFunction(Some(&CAMediaTimingFunction::functionWithControlPoints(
+        c1x, c1y, c2x, c2y,
+    )));
+    // Same key as the property: a new change replaces the running animation.
+    layer.addAnimation_forKey(&motion, Some(&key));
 }
 
 /// Core Animation's layer space has its origin at the bottom-left; the model
@@ -201,7 +264,6 @@ fn add_rounded_rect(path: &CGMutablePath, rect: CGRect, radius: f64) {
 #[cfg(test)]
 mod tests {
     use objc2_core_foundation::CGSize;
-    use objc2_core_graphics::CGPath;
 
     use super::*;
     use crate::sys::geometry::SameAs;
