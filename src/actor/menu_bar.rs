@@ -348,6 +348,7 @@ fn sig(update: &Update) -> u64 {
             workspace.layout_mode.hash(&mut hash);
             workspace.is_active.hash(&mut hash);
             workspace.window_count.hash(&mut hash);
+            workspace.has_fullscreen.hash(&mut hash);
             workspace.windows.len().hash(&mut hash);
             for window in &workspace.windows {
                 let frame = window.info.frame;
@@ -422,6 +423,15 @@ mod tests {
         changed = base.clone();
         changed.displays.pop();
         assert_ne!(before, sig(&changed));
+    }
+
+    #[test]
+    fn signature_changes_when_workspace_fullscreen_changes() {
+        let base = update(vec![workspace("bsp")]);
+        let mut changed = base.clone();
+        changed.displays[0].workspaces[0].has_fullscreen = true;
+
+        assert_ne!(sig(&base), sig(&changed));
     }
 
     #[test]
