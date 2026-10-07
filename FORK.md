@@ -28,6 +28,8 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
 | 11 | native window borders + dimming (`[settings.ui.border]`, `[settings.ui.dim]`) | `b17bd6e` to `7171c2c` (6) | done, off by default |
 | 12 | floating windows above tiled ones (`[settings] floating_windows_on_top`) | `ca789bf`, `d63800c` | done, off by default |
 | 13 | input-freeze fix: event tap on its own thread, non-blocking timeout handler, tap breaker (`[settings] event_tap_timeout_limit`) | `b03e557`, `3bb738a` | done |
+| 14 | `workspace_changed` at once when a switch only focuses another display; no repeat for a snapshot that re-confirms it | `89f3655`, `c18debe` | done |
+| 15 | built-in workspace HUD (`[settings.ui.workspace_hud]`), drawn at the switch decision | `295e558`, `fd3ab1d` | done, off by default |
 
 - Rows 1-4 are the former local branch `wms/fixes` (base 3a99afa, v0.6.7), rebased onto
   upstream 0.6.8. Root-cause write-ups: `wms/docs/incidents/2026-10-05-rift-*.md`.
@@ -54,6 +56,17 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
   `event_tap_timeout_limit` (default 3) timeouts in 60 s input passes through unfiltered for
   5-60 s. Active by default (hotkey semantics unchanged); upstream-worthy. Review:
   `wms/docs/rift-fork-review-2026-10-06.md` (third pass).
+- Row 14 has no config key. With global workspaces a switch to the workspace another display
+  shows (and `focus_display`) reports `workspace_changed` with the command instead of ~200 ms
+  later from the space snapshot; the engine remembers its last report (space, workspace, name)
+  and a snapshot that only re-confirms it stays quiet. Workspace activations, focus moved by a
+  click, native Space switches and renames still report. Upstream-worthy.
+- Row 15 replaces the external HUD (macos-flash-centered-hud via a `workspace_changed`
+  subscription): the reactor sends one show when it decides a user switch (before focus and
+  raise work, no WindowServer/AX query), the main-thread actor draws a pre-built compositor
+  overlay per display. Style presets card/pill/minimal/toast, 9 anchors, display choice.
+  Off by default; the config block needs the new binary (`deny_unknown_fields`). Review of
+  rows 14-15: `wms/docs/rift-fork-review-2026-10-06.md` (fourth pass).
 - Status values: planned, in progress, done (on `main`), live (deployed), upstreamed, dropped.
 - Update this table in the same commit that changes a patch's status.
 
