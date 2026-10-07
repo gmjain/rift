@@ -104,7 +104,11 @@ impl VirtualWorkspace {
         self.layout_mode = mode;
         self.layout_system = Self::create_layout_system(mode, settings);
         let layout = self.layout_system.create_layout();
+        let size = self.layout_state.active_size();
         self.layout_state.replace(layout);
+        if let Some(size) = size {
+            self.layout_system.set_layout_size_hint(layout, size);
+        }
         layout
     }
 
@@ -112,12 +116,15 @@ impl VirtualWorkspace {
 
     pub fn create_layout_system(mode: LayoutMode, settings: &LayoutSettings) -> LayoutSystemKind {
         match mode {
-            LayoutMode::Traditional => LayoutSystemKind::Traditional(
-                crate::layout_engine::systems::TraditionalLayoutSystem::new(
+            LayoutMode::Traditional => {
+                let mut system = crate::layout_engine::systems::TraditionalLayoutSystem::new(
                     settings.window_insertion_point_for(mode),
                     settings.traditional.equalize_nodes,
-                ),
-            ),
+                );
+                system.set_auto_split_by_aspect(settings.traditional.auto_split_by_aspect);
+                system.set_root_orientation(settings.traditional.root_orientation);
+                LayoutSystemKind::Traditional(system)
+            }
             LayoutMode::Floating => LayoutSystemKind::Floating(
                 crate::layout_engine::systems::FloatingLayoutSystem::new(
                     settings.window_insertion_point_for(mode),

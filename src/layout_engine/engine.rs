@@ -718,6 +718,8 @@ impl LayoutEngine {
                 LayoutSystemKind::Traditional(system) => {
                     system.set_window_insertion_point(insertion_point);
                     system.set_equalize_nodes(settings.traditional.equalize_nodes);
+                    system.set_auto_split_by_aspect(settings.traditional.auto_split_by_aspect);
+                    system.set_root_orientation(settings.traditional.root_orientation);
                 }
                 LayoutSystemKind::Floating(system) => {
                     system.set_window_insertion_point(insertion_point);
@@ -5874,5 +5876,54 @@ mod tests {
             window_store.workspace_for_window(space, wid),
             Some(target_workspace)
         );
+    }
+
+    fn portrait_traditional_frames(mode: LayoutMode) -> HashMap<WindowId, CGRect> {
+        let mut settings = LayoutSettings::default();
+        settings.mode = mode;
+        settings.traditional.auto_split_by_aspect = true;
+        let mut engine = LayoutEngine::new(&VirtualWorkspaceSettings::default(), &settings, None);
+        let mut store = WindowStore::default();
+        let space = SpaceId::new(93);
+        let screen = CGRect::new(CGPoint::ZERO, CGSize::new(1000.0, 1600.0));
+        let _ = engine.handle_event(&mut store, LayoutEvent::SpaceExposed(space, screen.size));
+        for index in 1..=2 {
+            let _ = engine.handle_event(
+                &mut store,
+                LayoutEvent::WindowAdded(space, WindowId::new(1, index)),
+            );
+        }
+        if mode != LayoutMode::Traditional {
+            let workspace = engine.workspaces.active_workspace(space).unwrap();
+            assert!(engine.switch_workspace_layout_mode(
+                &store,
+                space,
+                workspace,
+                LayoutMode::Traditional
+            ));
+        }
+        engine
+            .calculate_layout(
+                space,
+                screen,
+                &Default::default(),
+                0.0,
+                Default::default(),
+                Default::default(),
+            )
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn traditional_aspect_split_knows_the_display_before_the_first_layout_pass() {
+        // Added on exposure, and when an existing workspace switches to traditional.
+        for mode in [LayoutMode::Traditional, LayoutMode::Bsp] {
+            let frames = portrait_traditional_frames(mode);
+            let top = CGRect::new(CGPoint::ZERO, CGSize::new(1000.0, 800.0));
+            let bottom = CGRect::new(CGPoint::new(0.0, 800.0), CGSize::new(1000.0, 800.0));
+            assert_eq!(frames[&WindowId::new(1, 1)], top, "{mode:?}");
+            assert_eq!(frames[&WindowId::new(1, 2)], bottom, "{mode:?}");
+        }
     }
 }

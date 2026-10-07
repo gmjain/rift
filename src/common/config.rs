@@ -984,6 +984,15 @@ pub struct TraditionalLayoutSettings {
     /// average sibling weight instead of splitting the selected node's share.
     #[serde(default = "yes")]
     pub equalize_nodes: bool,
+    /// Split the selected node along its longer side when a window is added next to it:
+    /// side by side when it is wider than tall, stacked otherwise. A new container is
+    /// nested when its parent splits the other way.
+    #[serde(default = "no")]
+    pub auto_split_by_aspect: bool,
+    /// Orientation an empty layout's root takes when its first window arrives.
+    /// Unset keeps the root's current orientation.
+    #[serde(default)]
+    pub root_orientation: Option<RootOrientation>,
 }
 
 impl Default for TraditionalLayoutSettings {
@@ -991,8 +1000,19 @@ impl Default for TraditionalLayoutSettings {
         Self {
             base: BaseLayoutSettings::default(),
             equalize_nodes: true,
+            auto_split_by_aspect: false,
+            root_orientation: None,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum RootOrientation {
+    Horizontal,
+    Vertical,
+    /// Horizontal on landscape displays, vertical on portrait ones.
+    Auto,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -2085,6 +2105,27 @@ mod tests {
         );
         assert!(settings.traditional.equalize_nodes);
         assert_eq!(settings.scrolling.animate, Some(false));
+    }
+
+    #[test]
+    fn aspect_split_settings_default_off_and_parse() {
+        let defaults: LayoutSettings = toml::from_str("").unwrap();
+        assert!(!defaults.traditional.auto_split_by_aspect);
+        assert_eq!(defaults.traditional.root_orientation, None);
+
+        let settings: LayoutSettings = toml::from_str(
+            r#"
+                [traditional]
+                auto_split_by_aspect = true
+                root_orientation = "auto"
+            "#,
+        )
+        .unwrap();
+        assert!(settings.traditional.auto_split_by_aspect);
+        assert_eq!(
+            settings.traditional.root_orientation,
+            Some(RootOrientation::Auto)
+        );
     }
 
     #[test]
