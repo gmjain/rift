@@ -3282,6 +3282,7 @@ impl Reactor {
             self.maybe_send_menu_update();
             return Ok(outcome);
         }
+        let mut vanished_displays = Vec::new();
         if display_set_changed {
             if let Some(tx) = &self.animation_tx {
                 let _ = tx.send(animation::Message::Displays(
@@ -3290,6 +3291,7 @@ impl Reactor {
             }
             let active_displays: Vec<String> =
                 screens.iter().map(|screen| screen.display_uuid.clone()).collect();
+            vanished_displays = self.vanished_displays(&screens);
             self.record_vanished_display_spaces(&screens);
             self.layout_manager.layout_engine.prune_display_state(&active_displays);
         }
@@ -3330,6 +3332,11 @@ impl Reactor {
             self.layout_manager
                 .layout_engine
                 .update_space_display(space, Some(display_uuid.to_string()));
+        }
+        // Before the reconcile files their windows one by one: carry the workspaces
+        // of displays that left over to a remaining display, layouts and all.
+        if !vanished_displays.is_empty() {
+            outcome.absorb(self.rehome_workspaces_of_vanished_displays(vanished_displays));
         }
         let current_screens = self.space_state.screens.clone();
         self.space_activation_policy
