@@ -567,6 +567,11 @@ pub struct Settings {
     /// inappropriately steal focus and shouldn't cause workspace switches.
     #[serde(default)]
     pub auto_focus_blacklist: Vec<String>,
+    /// Keep floating windows above tiled ones (i3 semantics): when a tiled window
+    /// gains focus, re-raise the visible floating windows of its workspace above it
+    /// without activating their apps.
+    #[serde(default = "no")]
+    pub floating_windows_on_top: bool,
     #[serde(default)]
     pub layout: LayoutSettings,
     #[serde(default)]
@@ -2733,6 +2738,15 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.settings.drag_drop.modifier, MouseModifier::Alt);
         assert_eq!(cfg.settings.drag_drop.drop_action, MouseDropAction::Stack);
+    }
+
+    #[test]
+    fn floating_windows_on_top_is_off_by_default_and_parses() {
+        assert!(!Config::default().settings.floating_windows_on_top);
+        let settings: Settings = toml::from_str("floating_windows_on_top = true").unwrap();
+        assert!(settings.floating_windows_on_top);
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(!settings.floating_windows_on_top);
     }
 
     #[test]
