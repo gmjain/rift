@@ -1022,6 +1022,9 @@ pub struct BspLayoutSettings {
     pub base: BaseLayoutSettings,
     /// Center a lone window at this width-to-height ratio.
     pub single_window_aspect_ratio: Option<f64>,
+    /// Split the selected window along its longer side instead of alternating by depth.
+    #[serde(default)]
+    pub auto_split_by_aspect: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -2111,6 +2114,7 @@ mod tests {
     fn aspect_split_settings_default_off_and_parse() {
         let defaults: LayoutSettings = toml::from_str("").unwrap();
         assert!(!defaults.traditional.auto_split_by_aspect);
+        assert!(!defaults.bsp.auto_split_by_aspect);
         assert_eq!(defaults.traditional.root_orientation, None);
 
         let settings: LayoutSettings = toml::from_str(
@@ -2118,10 +2122,14 @@ mod tests {
                 [traditional]
                 auto_split_by_aspect = true
                 root_orientation = "auto"
+
+                [bsp]
+                auto_split_by_aspect = true
             "#,
         )
         .unwrap();
         assert!(settings.traditional.auto_split_by_aspect);
+        assert!(settings.bsp.auto_split_by_aspect);
         assert_eq!(
             settings.traditional.root_orientation,
             Some(RootOrientation::Auto)

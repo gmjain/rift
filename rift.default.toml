@@ -114,6 +114,11 @@ auto_split_by_aspect = false
 # Unset keeps the root as it is (new roots start horizontal).
 # root_orientation = "auto"
 
+# these settings only apply when layout mode == "bsp"
+[settings.layout.bsp]
+# Split the selected window along its longer side instead of alternating by depth.
+auto_split_by_aspect = false
+
 # these settings only apply when layout mode == "master_stack"
 [settings.layout.master_stack]
 # Fraction of space reserved for the master area (0.05..0.95)
