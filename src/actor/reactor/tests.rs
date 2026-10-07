@@ -10048,6 +10048,42 @@ fn global_workspaces_come_back_after_a_restart_restored_from_the_layout_file() {
 }
 
 #[test]
+fn a_layout_file_from_another_boot_needs_more_than_a_window_server_id() {
+    // WindowServer ids restart with every boot: there, a matching id proves nothing.
+    let restart = restart_global_layout(true, |file| {
+        let session = regex::Regex::new(r#""boot_session":Some\("[^"]*"\)"#).unwrap();
+        assert!(
+            session.is_match(&file),
+            "the file records the boot it was saved in"
+        );
+        session.replace(&file, r#""boot_session":Some("another boot")"#).into_owned()
+    });
+    let unbundled = restart.unbundled;
+    let without = |state: &GlobalLayoutState| -> Vec<_> {
+        state
+            .windows
+            .iter()
+            .filter(|(window, ..)| *window != unbundled)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        without(&restart.after),
+        without(&restart.before),
+        "windows of known apps still match by app and WindowServer id"
+    );
+    assert!(
+        restart
+            .after
+            .arrangements
+            .iter()
+            .any(|(_, _, windows)| { windows.iter().any(|(window, _)| *window == unbundled) }),
+        "an unmatched window is still managed: {:?}",
+        restart.after
+    );
+}
+
+#[test]
 fn a_layout_file_without_window_server_ids_or_boot_still_restores() {
     // Written before rift saved WindowServer ids: windows match by app and title.
     let restart = restart_global_layout(false, |file| {

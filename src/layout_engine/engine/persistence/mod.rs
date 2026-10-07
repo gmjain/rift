@@ -271,6 +271,13 @@ impl LayoutEngine {
             app_id: app_id.filter(|app_id| !app_id.trim().is_empty()).map(str::to_owned),
         };
         let outcome = self.reconcile_restored_window(window_store, space, window, &fingerprint);
+        if !outcome.matched && self.persistence.pending_windows.contains(&window) {
+            // A saved window with this live window's id that did not match it is another
+            // window (an id from an earlier boot). Its placeholder must go now: left in place,
+            // it keeps the live window out of the layout (the tree already "contains" the id)
+            // and later takes the live window with it when unmatched placeholders are dropped.
+            self.discard_candidates(vec![window]);
+        }
         self.persistence.record(window, fingerprint);
         outcome.matched
     }
