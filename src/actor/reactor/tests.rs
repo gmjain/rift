@@ -8084,6 +8084,15 @@ fn bound_reactor(settings: crate::common::config::VirtualWorkspaceSettings) -> R
     reactor
 }
 
+fn bound_reactor_with_layout(
+    layout: LayoutEngine,
+    settings: crate::common::config::VirtualWorkspaceSettings,
+) -> Reactor {
+    let mut reactor = Reactor::new_for_test(layout);
+    reactor.config.virtual_workspaces = settings;
+    reactor
+}
+
 fn active_workspace_of(
     reactor: &Reactor,
     space: SpaceId,
@@ -9420,4 +9429,203 @@ fn global_workspaces_create_workspace_adds_it_to_every_display() {
         Some(3),
         "ws4 shows on the right display, ws1 is free again"
     );
+}
+
+/// What a restart must keep: each display's showing workspace, the display owning each
+/// workspace, where every window lives, and each workspace's arrangement.
+#[derive(Debug, PartialEq)]
+struct GlobalLayoutState {
+    showing: Vec<Option<usize>>,
+    owners: Vec<Option<SpaceId>>,
+    windows: Vec<(WindowId, Option<SpaceId>, Option<usize>)>,
+    arrangements: Vec<(SpaceId, usize, Vec<(WindowId, CGRect)>)>,
+}
+
+fn global_layout_state(
+    reactor: &mut Reactor,
+    displays: &[(SpaceId, CGRect)],
+    windows: &[WindowId],
+) -> GlobalLayoutState {
+    let count = reactor.test_workspace_ids(displays[0].0).len();
+    let mut windows: Vec<_> = windows
+        .iter()
+        .map(|&window| {
+            let space = reactor.assigned_space_for_window_id(window);
+            let index = space.and_then(|space| {
+                let workspace = reactor.test_workspace_for_window(space, window)?;
+                reactor.test_workspace_ids(space).iter().position(|id| *id == workspace)
+            });
+            (window, space, index)
+        })
+        .collect();
+    windows.sort_by_key(|(window, ..)| *window);
+    let mut arrangements = Vec::new();
+    for &(space, screen) in displays {
+        for index in 0..count {
+            let arrangement = workspace_layout_shifted(reactor, space, index, screen, 0.);
+            if !arrangement.is_empty() {
+                arrangements.push((space, index, arrangement));
+            }
+        }
+    }
+    GlobalLayoutState {
+        showing: displays
+            .iter()
+            .map(|(space, _)| active_workspace_index_of(reactor, *space))
+            .collect(),
+        owners: (0..count).map(|index| reactor.owner_space_for_workspace_index(index)).collect(),
+        windows,
+        arrangements,
+    }
+}
+
+/// Launch `pid` with `windows`, as an app without a bundle identifier (a bare executable).
+fn launch_unbundled_app(
+    apps: &mut Apps,
+    reactor: &mut Reactor,
+    pid: pid_t,
+    windows: Vec<WindowInfo>,
+) {
+    let mut events = apps.make_app(pid, windows);
+    for event in &mut events {
+        if let Event::ApplicationLaunched { info, .. } = event {
+            info.bundle_id = None;
+        }
+    }
+    reactor.handle_events(events);
+    apps.simulate_until_quiet(reactor);
+}
+
+/// A two-display global layout before a restart and after `rift --restore` brought it back.
+/// `rename` changes every window's title while rift is down; `edit_file` rewrites the saved
+/// layout file before the restart reads it.
+struct GlobalRestart {
+    before: GlobalLayoutState,
+    after: GlobalLayoutState,
+    unbundled: WindowId,
+}
+
+fn restart_global_layout(rename: bool, edit_file: impl FnOnce(String) -> String) -> GlobalRestart {
+    let settings = global_workspace_settings(4);
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(settings.clone());
+    let displays = [(left_space, left_screen()), (right_space, right_screen())];
+    // Left: ws0 shows app 1's first window next to an unbundled app's window; ws3 holds app
+    // 1's second window, parked.
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(3),
+        follow: false,
+        window_id: Some(2),
+    });
+    apps.simulate_until_quiet(&mut reactor);
+    let unbundled = WindowId::new(5, 1);
+    launch_unbundled_app(&mut apps, &mut reactor, 5, vec![make_window(1)]);
+    // Right: ws1 shows two windows, rearranged; ws2 holds a parked one.
+    focus_display_space(&mut reactor, right_space);
+    let shown = open_window_on_right(&mut apps, &mut reactor, 2);
+    let also_shown = open_window_on_right(&mut apps, &mut reactor, 3);
+    reactor.handle_test_layout_command(LayoutCommand::MoveNode(Direction::Right));
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(2));
+    let parked = open_window_on_right(&mut apps, &mut reactor, 4);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    apps.simulate_until_quiet(&mut reactor);
+    let windows = [
+        WindowId::new(1, 1),
+        WindowId::new(1, 2),
+        shown,
+        also_shown,
+        parked,
+        unbundled,
+    ];
+    let before = global_layout_state(&mut reactor, &displays, &windows);
+    assert_eq!(before.showing, vec![Some(0), Some(1)]);
+    assert_eq!(before.owners, vec![
+        Some(left_space),
+        Some(right_space),
+        Some(right_space),
+        Some(left_space)
+    ]);
+    assert_eq!(
+        before.windows.last(),
+        Some(&(unbundled, Some(left_space), Some(0)))
+    );
+
+    // `rift-cli execute save-layout`, then rift stops.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("layout.ron");
+    reactor.handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveLayout {
+        path: path.clone(),
+    })));
+    let frames: Vec<_> = windows.iter().map(|window| apps.windows[window].frame).collect();
+    drop(reactor);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, edit_file(saved)).unwrap();
+
+    // `rift --restore`: the same apps and windows.
+    let mut layout =
+        LayoutEngine::load_for_startup_restore_checking(path, |_, _| true, |_| true).unwrap();
+    layout.finish_loading(&settings, &Default::default(), None);
+    let mut restarted = bound_reactor_with_layout(layout, settings);
+    connect_displays(&mut restarted, vec![left_screen(), right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]);
+    let mut apps = Apps::new();
+    for pid in 1..=5 {
+        let infos = windows
+            .iter()
+            .zip(&frames)
+            .filter(|(window, _)| window.pid == pid)
+            .map(|(window, frame)| {
+                let title = if rename {
+                    format!("Renamed {window:?}")
+                } else {
+                    format!("Window{}", window.idx)
+                };
+                make_window_info(*frame, None, &title, None)
+            })
+            .collect();
+        if pid == unbundled.pid {
+            launch_unbundled_app(&mut apps, &mut restarted, pid, infos);
+        } else {
+            apps.make_app_and_settle(&mut restarted, pid, infos);
+        }
+    }
+    GlobalRestart {
+        before,
+        after: global_layout_state(&mut restarted, &displays, &windows),
+        unbundled,
+    }
+}
+
+#[test]
+fn global_workspaces_come_back_after_a_restart_restored_from_the_layout_file() {
+    let restart = restart_global_layout(true, |file| file);
+    assert_eq!(
+        restart.after, restart.before,
+        "same workspaces, owners and arrangements; renamed and unbundled windows included"
+    );
+}
+
+#[test]
+fn a_layout_file_without_window_server_ids_or_boot_still_restores() {
+    // Written before rift saved WindowServer ids: windows match by app and title.
+    let restart = restart_global_layout(false, |file| {
+        let ids = regex::Regex::new(r"window_server_id:Some\(\d+\),").unwrap();
+        let session = regex::Regex::new(r#""boot_session":Some\("[^"]*"\),?"#).unwrap();
+        let file = ids.replace_all(&file, "").into_owned();
+        session.replace(&file, "").into_owned()
+    });
+    let unbundled = restart.unbundled;
+    let without = |state: &GlobalLayoutState| -> Vec<_> {
+        state
+            .windows
+            .iter()
+            .filter(|(window, ..)| *window != unbundled)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(without(&restart.after), without(&restart.before));
+    assert_eq!(restart.after.showing, restart.before.showing);
+    assert_eq!(restart.after.owners, restart.before.owners);
 }

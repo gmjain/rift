@@ -21,6 +21,34 @@ use crate::sys::screen::SpaceId;
 
 static SAVE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// This boot's identity (`kern.bootsessionuuid`), recorded in every saved layout. WindowServer
+/// ids start over with each boot, so they identify a saved window only within the same boot.
+pub(super) fn current_boot_session() -> Option<&'static str> {
+    static SESSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SESSION.get_or_init(read_boot_session).as_deref()
+}
+
+fn read_boot_session() -> Option<String> {
+    let mut buffer = [0u8; 128];
+    let mut size = buffer.len();
+    // SAFETY: the name is NUL-terminated and `size` is the buffer's length.
+    let result = unsafe {
+        nix::libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    let value = std::ffi::CStr::from_bytes_until_nul(&buffer[..size.min(buffer.len())]).ok()?;
+    let value = value.to_str().ok()?.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoreRequest {
     pub scope: RestoreScope,
@@ -123,6 +151,14 @@ impl WindowFingerprint {
             && (self.same_known_app(live) || self.same_title_and_size(live))
     }
 
+    /// Both ids name the same WindowServer window and no known app identity says otherwise.
+    /// Only proof of identity in the boot that assigned the id.
+    fn same_window_server_window(&self, live: &Self) -> bool {
+        self.window_server_id.is_some()
+            && self.window_server_id == live.window_server_id
+            && self.app_compatible_with(live)
+    }
+
     fn same_known_app(&self, live: &Self) -> bool {
         self.app_id.is_some() && self.app_id == live.app_id
     }
@@ -146,6 +182,11 @@ pub(super) struct PersistenceState {
     saved_active_space: Option<u64>,
     #[serde(skip)]
     pending_windows: HashSet<WindowId>,
+    /// The loaded file was saved in this boot. A window keeps its WindowServer id for as long
+    /// as it exists, and ids are not reused within a boot, so a live window with the saved
+    /// window's process and WindowServer id is that window, whatever its title is now.
+    #[serde(skip)]
+    trusted_window_ids: bool,
 }
 
 impl PersistenceState {

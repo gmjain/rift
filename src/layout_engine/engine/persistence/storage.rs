@@ -13,9 +13,8 @@ impl LayoutEngine {
     /// Load the master snapshot used for process startup and report its persisted coverage.
     /// Validation and menu previews continue to use `load` without emitting restore logs.
     pub fn load_for_startup_restore(path: PathBuf) -> anyhow::Result<Self> {
-        let (mut engine, schema_version) = Self::load_with_schema_version(&path)?;
-        engine.startup_restore_pending = true;
-        let unavailable_windows = engine.discard_unmatchable_startup_candidates(
+        Self::load_for_startup_restore_checking(
+            path,
             |window, id| {
                 crate::sys::window_server::get_window(
                     crate::sys::window_server::WindowServerId::new(id),
@@ -23,7 +22,20 @@ impl LayoutEngine {
                 .is_some_and(|info| info.pid == window.pid)
             },
             crate::sys::app::is_bundle_running,
-        );
+        )
+    }
+
+    /// `load_for_startup_restore`, asking `window_exists` and `app_running` instead of macOS
+    /// which saved windows can still be matched.
+    pub(crate) fn load_for_startup_restore_checking(
+        path: PathBuf,
+        window_exists: impl FnMut(WindowId, u32) -> bool,
+        app_running: impl FnMut(&str) -> bool,
+    ) -> anyhow::Result<Self> {
+        let (mut engine, schema_version) = Self::load_with_schema_version(&path)?;
+        engine.startup_restore_pending = true;
+        let unavailable_windows =
+            engine.discard_unmatchable_startup_candidates(window_exists, app_running);
         tracing::info!(
             path = %path.display(),
             schema_version,
