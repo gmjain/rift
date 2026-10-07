@@ -97,6 +97,10 @@ pub fn take_receiver(event: CGSEventType) -> actor::Receiver<EventData> {
 }
 
 pub fn update_window_notifications(window_ids: &[u32]) {
+    // Test window ids are fixtures; don't subscribe the test process to real windows.
+    if cfg!(test) {
+        return;
+    }
     unsafe {
         let _ = SLSRequestNotificationsForWindows(
             *G_CONNECTION,
