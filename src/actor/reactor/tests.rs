@@ -9388,6 +9388,47 @@ fn focusing_a_display_reports_its_workspace_only_when_focus_moves() {
 }
 
 #[test]
+fn a_space_snapshot_does_not_repeat_the_workspace_a_switch_just_reported() {
+    let (mut apps, mut reactor, left_space, right_space, mut broadcasts) =
+        two_display_global_reactor_with_broadcasts(global_workspace_settings(4));
+    // A full snapshot (not a command-space-only update) naming `focused` as the
+    // display with focus, as the spaces actor sends after the native display change.
+    let snapshot = |focused: SpaceId| {
+        space_state_event_with(
+            vec![left_screen(), right_screen()],
+            vec![Some(left_space), Some(right_space)],
+            |state| {
+                state.command_space = Some(focused);
+                state.menu_bar_space = Some(focused);
+                state.should_force_refresh_layout = true;
+            },
+        )
+    };
+    workspace_changes(&mut broadcasts);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    assert_eq!(workspace_changes(&mut broadcasts), vec![(
+        right_space.get(),
+        "ws1".to_string()
+    )]);
+
+    reactor.handle_event(snapshot(right_space));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(
+        workspace_changes(&mut broadcasts),
+        vec![],
+        "the snapshot only re-confirms ws1 on the right display"
+    );
+
+    // Focus moving without rift (a click on the left display) is still reported.
+    reactor.handle_event(snapshot(left_space));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(workspace_changes(&mut broadcasts), vec![(
+        left_space.get(),
+        "ws0".to_string()
+    )]);
+}
+
+#[test]
 fn global_workspaces_move_a_window_to_the_display_owning_the_workspace() {
     let (mut apps, mut reactor, left_space, right_space) =
         two_display_global_reactor(global_workspace_settings(4));
