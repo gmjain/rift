@@ -1208,6 +1208,7 @@ impl Reactor {
                 }
                 self.apply_event_outcome(outcome);
                 self.apply_pending_display_bindings();
+                self.settle_global_workspaces();
                 if may_make_ready
                     && self.startup_ready.is_some()
                     && let Some(space) = self.default_query_space()

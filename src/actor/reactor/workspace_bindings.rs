@@ -19,6 +19,12 @@
 //!
 //! When the owning display is not connected the workspace behaves like an
 //! unbound one on whatever display the user is on.
+//!
+//! With `scope = "global"` every workspace has an owner, derived rather than
+//! configured: the display whose copy of it is showing or holds windows (a
+//! binding above forces the owner). A workspace no display owns does not exist
+//! yet, as in i3. Each display starts on a workspace no other display owns,
+//! and cycling on a display runs over its own and the unowned workspaces.
 
 use tracing::warn;
 
@@ -66,17 +72,93 @@ impl Reactor {
         self.config.virtual_workspaces.has_display_bindings()
     }
 
+    /// Whether all displays share one set of workspaces.
+    pub(crate) fn has_global_workspaces(&self) -> bool {
+        self.config.virtual_workspaces.is_global()
+    }
+
+    /// Whether workspace commands may have to run on another display.
+    fn routes_workspace_commands(&self) -> bool {
+        self.config.virtual_workspaces.routes_workspaces()
+    }
+
     /// Tell the workspace manager, for every display in `screens`, which
-    /// workspace it starts on and which workspaces are bound to another one.
+    /// workspace it starts on and which workspaces belong to another one.
     ///
     /// Runs on each forwarded snapshot before any new native space gets its
     /// workspaces, so windows found on a display land in one of its own, and on
-    /// config reload.
+    /// config reload. With global workspaces owners change with every switch
+    /// and window move, so it also runs after each event and before a
+    /// workspace command is routed.
     pub(crate) fn refresh_display_bindings(&mut self, screens: &[ScreenInfo]) {
-        if !self.has_workspace_display_bindings() {
-            self.layout_manager.layout_engine.workspaces_mut().set_display_bindings([]);
-            return;
+        let bindings = self.display_bindings_for(screens);
+        self.layout_manager
+            .layout_engine
+            .workspaces_mut()
+            .set_display_bindings(bindings);
+    }
+
+    /// `refresh_display_bindings` for the displays currently on screen.
+    pub(crate) fn refresh_workspace_owners(&mut self) {
+        let bindings = self.display_bindings_for(&self.space_state.screens);
+        self.layout_manager
+            .layout_engine
+            .workspaces_mut()
+            .set_display_bindings(bindings);
+    }
+
+    /// Per display in `screens`: its native space, the workspace it starts on
+    /// and the workspaces owned by another display.
+    fn display_bindings_for(
+        &self,
+        screens: &[ScreenInfo],
+    ) -> Vec<(SpaceId, Option<usize>, HashSet<usize>)> {
+        if !self.routes_workspace_commands() {
+            return Vec::new();
         }
+        if !self.has_global_workspaces() {
+            return self.configured_display_bindings_for(screens);
+        }
+        let settings = &self.config.virtual_workspaces;
+        let count = settings.default_workspace_count.max(1);
+        let default = settings.default_workspace;
+        let workspaces = self.layout_manager.layout_engine.workspaces();
+        let mut owners: Vec<Option<SpaceId>> =
+            (0..count).map(|index| self.owner_space_among(screens, index)).collect();
+        let mut bindings = Vec::with_capacity(screens.len());
+        for screen in physical_order(screens) {
+            let Some(space) = screen.space else {
+                continue;
+            };
+            let owned_here = |owner: &Option<SpaceId>| *owner == Some(space);
+            let foreign: HashSet<usize> = (0..count)
+                .filter(|index| owners[*index].is_some_and(|owner| owner != space))
+                .collect();
+            // default_workspace if it may live here, else the first workspace
+            // owned here, else the first unowned one.
+            let start = (default < count && !foreign.contains(&default))
+                .then_some(default)
+                .or_else(|| owners.iter().position(owned_here))
+                .or_else(|| owners.iter().position(Option::is_none));
+            // A display without workspaces yet will own the one it starts on;
+            // displays to its right start elsewhere.
+            if workspaces.workspace_ids(space).is_empty()
+                && let Some(start) = start
+                && owners[start].is_none()
+            {
+                owners[start] = Some(space);
+            }
+            bindings.push((space, start, foreign));
+        }
+        bindings
+    }
+
+    /// `display_bindings_for` with per-display workspaces: only `workspace_rules`
+    /// bind workspaces to displays.
+    fn configured_display_bindings_for(
+        &self,
+        screens: &[ScreenInfo],
+    ) -> Vec<(SpaceId, Option<usize>, HashSet<usize>)> {
         let settings = &self.config.virtual_workspaces;
         let count = settings.default_workspace_count.max(1);
         let default = settings.default_workspace;
@@ -88,13 +170,16 @@ impl Reactor {
                     .map(|binding| bound_screen(screens, binding))
             })
             .collect();
-        let bindings: Vec<_> = screens
+        screens
             .iter()
             .filter_map(|screen| {
-                let owned_here =
-                    |owner: &Option<Option<&ScreenInfo>>| matches!(owner, Some(Some(owner)) if same_screen(owner, screen));
+                let owned_here = |owner: &Option<Option<&ScreenInfo>>| {
+                    matches!(owner, Some(Some(owner)) if same_screen(owner, screen))
+                };
                 let foreign: HashSet<usize> = (0..count)
-                    .filter(|index| matches!(owners[*index], Some(Some(_))) && !owned_here(&owners[*index]))
+                    .filter(|index| {
+                        matches!(owners[*index], Some(Some(_))) && !owned_here(&owners[*index])
+                    })
                     .collect();
                 // default_workspace if it may live here, else the first workspace
                 // bound here, else the first unbound one, else one not foreign.
@@ -105,19 +190,64 @@ impl Reactor {
                     .or_else(|| (0..count).find(|index| !foreign.contains(index)));
                 Some((screen.space?, start, foreign))
             })
-            .collect();
-        self.layout_manager
-            .layout_engine
-            .workspaces_mut()
-            .set_display_bindings(bindings);
+            .collect()
     }
 
     /// The active native space of the display workspace `index` is bound to, if
     /// that display is connected.
     fn bound_space_for_workspace_index(&self, index: usize) -> Option<SpaceId> {
+        self.bound_space_among(&self.space_state.screens, index)
+            .filter(|space| self.is_space_active(*space))
+    }
+
+    /// The native space of the display among `screens` workspace `index` is
+    /// bound to.
+    fn bound_space_among(&self, screens: &[ScreenInfo], index: usize) -> Option<SpaceId> {
         let binding = self.config.virtual_workspaces.display_binding_for_workspace(index)?;
-        let screen = bound_screen(&self.space_state.screens, binding)?;
-        screen.space.filter(|space| self.is_space_active(*space))
+        bound_screen(screens, binding)?.space
+    }
+
+    /// The native space of the display among `screens` workspace `index` lives
+    /// on: the one it is bound to, or with global workspaces the one showing it
+    /// or holding its windows. `None` means the workspace is unowned: bound to a
+    /// disconnected display, or not existing yet.
+    fn owner_space_among(&self, screens: &[ScreenInfo], index: usize) -> Option<SpaceId> {
+        self.bound_space_among(screens, index).or_else(|| {
+            self.has_global_workspaces()
+                .then(|| self.derived_owner_among(screens, index))
+                .flatten()
+        })
+    }
+
+    /// The display whose copy of workspace `index` is showing, else the one
+    /// whose copy holds the most windows. Ties go to the leftmost display.
+    fn derived_owner_among(&self, screens: &[ScreenInfo], index: usize) -> Option<SpaceId> {
+        let workspaces = self.layout_manager.layout_engine.workspaces();
+        let mut fullest: Option<(usize, SpaceId)> = None;
+        for screen in physical_order(screens) {
+            let Some(space) = screen.space else {
+                continue;
+            };
+            let Some(copy) = workspaces.workspace_ids(space).get(index).copied() else {
+                continue;
+            };
+            if workspaces.active_workspace(space) == Some(copy) {
+                return Some(space);
+            }
+            let windows = self.state.windows.workspace_window_count(space, copy);
+            if windows > 0 && fullest.is_none_or(|(most, _)| windows > most) {
+                fullest = Some((windows, space));
+            }
+        }
+        fullest.map(|(_, space)| space)
+    }
+
+    /// Bring the derived workspace owners up to date after an event changed
+    /// workspaces or windows.
+    pub(crate) fn settle_global_workspaces(&mut self) {
+        if self.has_global_workspaces() {
+            self.refresh_workspace_owners();
+        }
     }
 
     fn workspace_ordinal(&self, space: SpaceId, workspace: VirtualWorkspaceId) -> Option<usize> {
