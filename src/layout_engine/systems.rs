@@ -285,6 +285,14 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn toggle_fullscreen_of_selection(&mut self, layout: LayoutId) -> Vec<WindowId>;
     fn toggle_fullscreen_within_gaps_of_selection(&mut self, layout: LayoutId) -> Vec<WindowId>;
     fn has_any_fullscreen_node(&self, layout: LayoutId) -> bool;
+    /// Which fullscreen command, if any, `wid` is laid out under.
+    fn window_fullscreen_kind(
+        &self,
+        _layout: LayoutId,
+        _wid: WindowId,
+    ) -> Option<crate::layout_engine::FloatingFullscreenKind> {
+        None
+    }
 
     fn join_selection_with_direction(&mut self, _layout: LayoutId, _direction: Direction) {}
     fn consume_or_expel_selection(&mut self, layout: LayoutId, direction: Direction) {
@@ -374,6 +382,13 @@ macro_rules! delegate_traditional_layout_system {
         }
         fn has_any_fullscreen_node(&self, layout: LayoutId) -> bool {
             self.inner.has_any_fullscreen_node(layout)
+        }
+        fn window_fullscreen_kind(
+            &self,
+            layout: LayoutId,
+            wid: WindowId,
+        ) -> Option<crate::layout_engine::FloatingFullscreenKind> {
+            self.inner.window_fullscreen_kind(layout, wid)
         }
     };
     () => {

@@ -1081,6 +1081,25 @@ impl LayoutSystem for TraditionalLayoutSystem {
             .any(|node| self.tree.data.layout.is_effectively_fullscreen(node))
     }
 
+    fn window_fullscreen_kind(
+        &self,
+        layout: LayoutId,
+        wid: WindowId,
+    ) -> Option<crate::layout_engine::FloatingFullscreenKind> {
+        use crate::layout_engine::FloatingFullscreenKind;
+        let node = self.window_node(layout, wid)?;
+        node.ancestors(self.map()).find_map(|node| {
+            let info = &self.tree.data.layout.info[node];
+            if info.is_fullscreen {
+                Some(FloatingFullscreenKind::Full)
+            } else if info.is_fullscreen_within_gaps {
+                Some(FloatingFullscreenKind::WithinGaps)
+            } else {
+                None
+            }
+        })
+    }
+
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction) {
         let mut selection = self.selection(layout);
 

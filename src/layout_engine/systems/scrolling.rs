@@ -1959,6 +1959,22 @@ impl LayoutSystem for ScrollingLayoutSystem {
             .is_some_and(|s| !s.fullscreen.is_empty() || !s.fullscreen_within_gaps.is_empty())
     }
 
+    fn window_fullscreen_kind(
+        &self,
+        layout: LayoutId,
+        wid: WindowId,
+    ) -> Option<crate::layout_engine::FloatingFullscreenKind> {
+        use crate::layout_engine::FloatingFullscreenKind;
+        let state = self.layouts.get(layout)?;
+        if state.fullscreen.contains(&wid) {
+            Some(FloatingFullscreenKind::Full)
+        } else if state.fullscreen_within_gaps.contains(&wid) {
+            Some(FloatingFullscreenKind::WithinGaps)
+        } else {
+            None
+        }
+    }
+
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction) {
         if !matches!(direction, Direction::Left | Direction::Right) {
             return;

@@ -710,20 +710,20 @@ impl BorderSettings {
 
     pub fn validate(&self) -> Vec<String> {
         let mut issues = Vec::new();
-        if !(self.width >= 0.0) {
+        if self.width < 0.0 || self.width.is_nan() {
             issues.push(format!(
                 "ui.border.width must be non-negative, got {}",
                 self.width
             ));
         }
-        if !(self.radius >= 0.0) {
+        if self.radius < 0.0 || self.radius.is_nan() {
             issues.push(format!(
                 "ui.border.radius must be non-negative, got {}",
                 self.radius
             ));
         }
         if let Some(width) = self.fullscreen.and_then(|fullscreen| fullscreen.width)
-            && !(width >= 0.0)
+            && (width < 0.0 || width.is_nan())
         {
             issues.push(format!(
                 "ui.border.fullscreen.width must be non-negative, got {width}"

@@ -5,6 +5,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 use objc2::MainThreadMarker;
 use objc2_application_services::AXUIElement;
+use rift_wm::actor::border::Border;
 use rift_wm::actor::config::ConfigActor;
 use rift_wm::actor::config_watcher::ConfigWatcher;
 use rift_wm::actor::input::Input;
@@ -207,6 +208,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (input_tx, input_rx) = rift_wm::actor::channel();
     let (menu_tx, menu_rx) = rift_wm::actor::channel();
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
+    let (border_tx, border_rx) = rift_wm::actor::channel();
     let (wnd_tx, wnd_rx) = rift_wm::actor::channel();
     let window_tx_store = WindowTxStore::new();
     let native_motion_active: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
@@ -218,6 +220,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         broadcast_tx.clone(),
         menu_tx.clone(),
         stack_line_tx.clone(),
+        border_tx,
         Some((wnd_tx.clone(), window_tx_store.clone())),
         opt.one,
         native_motion_active.clone(),
@@ -329,6 +332,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         CoordinateConverter::default(),
         stack_line_hit_rects.clone(),
     );
+    let border = Border::new(config.clone(), border_rx, mtm);
 
     let mission_control = mc_channel.map(|(tx, rx)| {
         MissionControlActor::new(
@@ -388,6 +392,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             supervise("spaces", spaces_actor.run()),
             supervise("menu", menu.run()),
             supervise("stack_line", stack_line.run()),
+            supervise("border", border.run()),
             supervise("window_notify", wn_actor.run()),
             supervise("mc_native", mission_control_native.run()),
             async move {

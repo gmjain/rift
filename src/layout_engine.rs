@@ -11,6 +11,7 @@ pub use engine::{
     ResolvedWindow, RestoreReport, RestoreRequest, RestoreScope, RestoreSource, RestoreWarning,
     write_layout_snapshot,
 };
+pub use floating::FloatingFullscreenKind;
 pub(crate) use floating::FloatingManager;
 pub use graph::{Direction, LayoutKind, Orientation, ResizeOrientation};
 

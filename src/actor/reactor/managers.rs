@@ -190,6 +190,7 @@ pub struct RefocusManager {
 pub struct CommunicationManager {
     pub input_tx: Option<input::Sender>,
     pub stack_line_tx: Option<stack_line::Sender>,
+    pub border_tx: Option<crate::actor::border::Sender>,
     pub raise_manager_tx: raise_manager::Sender,
     pub event_broadcaster: BroadcastSender,
     pub wm_sender: Option<wm_controller::Sender>,
