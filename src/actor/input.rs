@@ -2236,7 +2236,9 @@ impl Input {
                     // The proxy is valid only during this tap callback. Held events
                     // must reach downstream taps before the current event returns.
                     unsafe { CGEvent::tap_post_event(proxy, Some(held)) };
-                } else {
+                } else if !cfg!(test) {
+                    // Tests feed synthetic gestures to the filter; never post them into the
+                    // live session, where the running window manager would receive them.
                     CGEvent::post(CGTapLoc::SessionEventTap, Some(held));
                 }
             },
