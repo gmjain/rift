@@ -23,8 +23,8 @@ use super::testing::*;
 use super::*;
 use crate::actor::app::pid_t;
 use crate::common::collections::BTreeMap;
-use crate::common::config::{AppWorkspaceRule, VirtualWorkspaceSettings};
-use crate::layout_engine::LayoutEvent;
+use crate::common::config::{AppWorkspaceRule, VirtualWorkspaceSettings, WorkspaceScope};
+use crate::layout_engine::{LayoutCommand, LayoutEvent};
 use crate::sys::app::WindowInfo;
 use crate::sys::window_server::{self, WindowServerId};
 
@@ -81,6 +81,13 @@ impl Storm {
     /// `parked`: one char per window parked in an inactive workspace, in wsid order;
     /// 'B' = built-in, 'E' = external display. `parked_floating`: parked windows float.
     fn new(parked: &str, parked_floating: bool) -> Storm {
+        Self::with_scope(parked, parked_floating, false)
+    }
+
+    /// `global`: one set of workspaces shared by both displays (four of them: the built-in
+    /// shows ws0 and parks in ws1, the external shows ws2 and parks in ws3) instead of a set
+    /// per display (three each: ws0 shown, ws1 parked).
+    fn with_scope(parked: &str, parked_floating: bool, global: bool) -> Storm {
         window_server::set_test_no_cursor_window(true);
         window_server::set_space_window_list_for_connection_override(Some(vec![]));
         let builtin = SpaceId::new(1);
@@ -91,7 +98,12 @@ impl Storm {
             ..Default::default()
         });
         let settings = VirtualWorkspaceSettings {
-            default_workspace_count: 3,
+            default_workspace_count: if global { 4 } else { 3 },
+            scope: if global {
+                WorkspaceScope::Global
+            } else {
+                WorkspaceScope::PerDisplay
+            },
             app_rules: rules.collect(),
             ..Default::default()
         };
@@ -120,9 +132,21 @@ impl Storm {
         };
         let snapshot = storm.snapshot(builtin, None);
         storm.reactor.handle_event(snapshot);
+        // Which workspace each display shows and which it parks in.
+        let workspaces_of = |space: SpaceId| -> (usize, usize) {
+            if global && space == external {
+                (2, 3)
+            } else {
+                (0, 1)
+            }
+        };
+        if global {
+            let ws2 = storm.reactor.test_workspace(external, 2);
+            assert!(storm.reactor.set_test_active_workspace(external, ws2));
+        }
 
-        // Launch each parked window while workspace 1 of its display is active, then go back to
-        // workspace 0.
+        // Launch each parked window while its display shows the parking workspace, then go
+        // back to the shown one.
         for (i, display) in parked.chars().enumerate() {
             let pid = PARKED_PID + i as pid_t;
             let (space, frame) = match display {
@@ -130,12 +154,13 @@ impl Storm {
                 'E' => (external, rect(-1435., -975., 1430., 1260.)),
                 other => panic!("bad display {other:?}"),
             };
-            let ws1 = storm.reactor.test_workspace(space, 1);
-            assert!(storm.reactor.set_test_active_workspace(space, ws1));
+            let (shown, hidden) = workspaces_of(space);
+            let park = storm.reactor.test_workspace(space, hidden);
+            assert!(storm.reactor.set_test_active_workspace(space, park));
             storm.parked.push(WindowId::new(pid, 1));
             storm.launch(pid, space, vec![make_window_info(frame, None, "parked", None)]);
-            let ws0 = storm.reactor.test_workspace(space, 0);
-            assert!(storm.reactor.set_test_active_workspace(space, ws0));
+            let show = storm.reactor.test_workspace(space, shown);
+            assert!(storm.reactor.set_test_active_workspace(space, show));
         }
         storm.launch(CHROME, builtin, vec![make_window_info(
             rect(5., 40., 1790., 1124.),
@@ -229,14 +254,27 @@ impl Storm {
 
     fn space_of(&self, wid: WindowId) -> SpaceId { self.native_space[&wsid_of(wid)] }
 
+    /// A workspace command as the user's hotkey sends it, acting on the display with focus.
+    fn command(&mut self, command: LayoutCommand) {
+        self.reactor.handle_test_layout_command(command);
+        self.apps.simulate_until_quiet(&mut self.reactor);
+    }
+
     /// One authoritative snapshot (as after an active-display change), then execute focus raises
     /// FIFO like the raise manager, feeding the resulting activations back.
     fn run(&mut self, cover_follows_menu_bar: bool, max_raises: usize) -> Tally {
-        let mut tally = Tally::default();
         let cover = |menu| cover_follows_menu_bar.then_some(menu);
         let snapshot = self.snapshot(self.menu, cover(self.menu));
         self.reactor.handle_event(snapshot);
         self.apps.simulate_until_quiet(&mut self.reactor);
+        self.drive(cover_follows_menu_bar, max_raises)
+    }
+
+    /// Execute the queued focus raises FIFO like the raise manager, feeding the resulting
+    /// activations (and, on a cross-display one, the menu bar move) back.
+    fn drive(&mut self, cover_follows_menu_bar: bool, max_raises: usize) -> Tally {
+        let mut tally = Tally::default();
+        let cover = |menu| cover_follows_menu_bar.then_some(menu);
         let mut queue: VecDeque<RaiseRequest> = self.drain_raises().into();
         while let Some(request) = queue.pop_front() {
             if tally.focus_raises == max_raises {
@@ -372,4 +410,68 @@ fn refocus_on_display_without_focus_does_not_raise() {
     let ws1 = storm.reactor.test_workspace(external, 1);
     assert!(storm.reactor.test_workspace_windows(external, ws1).contains(&parked));
     assert_eq!(focus_targets(&storm.drain_raises()), vec![]);
+}
+
+/// With shared workspaces every remote `alt-N` focuses the other display, the very move that
+/// sustained the storm. Each such switch must cost one activation and one menu-bar flip and then
+/// leave the raise queue empty, with parked windows on both displays and the menu bar cover
+/// present: no ping-pong, however often the user switches back and forth.
+#[test]
+fn global_workspaces_remote_switches_do_not_storm() {
+    for parked_floating in [false, true] {
+        let mut storm = Storm::with_scope(INCIDENT_PARKED, parked_floating, true);
+        let (builtin, external) = (storm.builtin, storm.external);
+        assert_eq!(storm.reactor.space_state.command_space, Some(builtin));
+        // ws2 shows on the external display, ws3 is parked there; ws0 shows on the built-in
+        // and ws1 is parked there. The user alternates between the displays.
+        let switches = [2, 0, 3, 1, 2, 1, 2, 0];
+        for (step, index) in switches.into_iter().enumerate() {
+            let display = if index >= 2 { external } else { builtin };
+            storm.command(LayoutCommand::SwitchToWorkspace(index));
+            let tally = storm.drive(true, 200);
+            let case = format!("floating={parked_floating} step={step} alt-{index}: {tally:?}");
+            assert_eq!(tally.queue_left, 0, "{case}");
+            assert!(tally.activations <= 1, "{case}");
+            assert!(tally.display_flips <= 1, "{case}");
+            // Any further raise targets the app already in front. (Hidden floating windows
+            // still arm one such no-op refocus each per full snapshot after a switch: the
+            // re-confirmation check cannot tell a parked floating window from a returning
+            // one, in either scope.)
+            assert_eq!(
+                tally.noop_raises + tally.activations,
+                tally.focus_raises,
+                "{case}"
+            );
+            assert_eq!(storm.menu, display, "{case}: the menu bar follows the switch");
+            assert_eq!(
+                storm.reactor.space_state.command_space,
+                Some(display),
+                "{case}: commands act on the display switched to"
+            );
+            assert_eq!(
+                storm.space_of(WindowId::new(storm.front, 1)),
+                display,
+                "{case}: the front app is on the display switched to"
+            );
+            let active = storm
+                .reactor
+                .layout_manager
+                .layout_engine
+                .workspaces()
+                .active_workspace_idx(display);
+            assert_eq!(active, Some(index as u64), "{case}");
+        }
+        // Everything is where it started: nothing moved between the displays.
+        for &wid in &storm.parked {
+            assert!(
+                !storm.reactor.test_active_workspace_windows(storm.space_of(wid)).contains(&wid)
+            );
+        }
+        assert_eq!(storm.reactor.test_active_workspace_windows(builtin), vec![
+            storm.chrome
+        ]);
+        assert_eq!(storm.reactor.test_active_workspace_windows(external), vec![
+            storm.firefox
+        ]);
+    }
 }
