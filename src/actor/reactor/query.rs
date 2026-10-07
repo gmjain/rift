@@ -421,6 +421,13 @@ impl Reactor {
                 })
                 .unwrap_or_else(|| "unknown".to_string());
 
+            let display_uuid = if self.has_global_workspaces() {
+                self.owner_space_for_workspace_index(index)
+                    .and_then(|owner| self.display_uuid_holding_space(owner))
+            } else {
+                space_id.and_then(|space| self.display_uuid_holding_space(space))
+            };
+
             workspaces.push(RuntimeWorkspaceData {
                 workspace_id: *workspace_id,
                 space: space_id.unwrap(),
@@ -431,10 +438,26 @@ impl Reactor {
                 window_count: windows.len(),
                 windows,
                 index,
+                display_uuid,
             });
         }
 
         workspaces
+    }
+
+    /// The display `space` belongs to: the one showing it, else the one whose
+    /// Spaces include it (a display in native fullscreen).
+    fn display_uuid_holding_space(&self, space: SpaceId) -> Option<String> {
+        self.space_state
+            .screen_by_space(space)
+            .map(|screen| screen.display_uuid.clone())
+            .or_else(|| {
+                self.space_state
+                    .display_space_ids
+                    .iter()
+                    .find(|(_, spaces)| spaces.contains(&space))
+                    .map(|(display, _)| display.clone())
+            })
     }
 
     pub fn query_workspace_layouts(

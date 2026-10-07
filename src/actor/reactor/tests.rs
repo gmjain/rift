@@ -9304,3 +9304,44 @@ fn global_workspaces_follow_a_display_that_goes_away_and_return_when_it_is_back(
     }
     clear_window_reports(&reactor, &[left_space, right_space], &windows);
 }
+
+#[test]
+fn global_workspaces_queries_report_the_display_owning_each_workspace() {
+    let (_apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    for space in [left_space, right_space] {
+        let owners: Vec<_> = reactor
+            .query_workspaces(Some(space))
+            .into_iter()
+            .map(|workspace| (workspace.index, workspace.display_uuid))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![
+                (0, Some("test-display-0".to_string())),
+                (1, Some("test-display-1".to_string())),
+                (2, None),
+                (3, None),
+            ],
+            "queried through {space:?}"
+        );
+    }
+
+    // With per-display workspaces every copy lives on the display queried.
+    let mut reactor = bound_reactor(crate::common::config::VirtualWorkspaceSettings {
+        default_workspace_count: 2,
+        ..Default::default()
+    });
+    connect_displays(&mut reactor, vec![left_screen(), right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]);
+    for (space, display) in [
+        (left_space, "test-display-0"),
+        (right_space, "test-display-1"),
+    ] {
+        for workspace in reactor.query_workspaces(Some(space)) {
+            assert_eq!(workspace.display_uuid.as_deref(), Some(display));
+        }
+    }
+}

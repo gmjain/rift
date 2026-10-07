@@ -24,6 +24,8 @@ pub struct RuntimeWorkspaceData {
     pub is_active: bool,
     pub window_count: usize,
     pub windows: Vec<RuntimeWindowData>,
+    /// The display the workspace lives on; see `rift_protocol::WorkspaceData`.
+    pub display_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,7 @@ impl From<RuntimeWorkspaceData> for protocol::WorkspaceData {
             layout_mode: value.layout_mode,
             is_active: value.is_active,
             window_count: value.window_count,
+            display_uuid: value.display_uuid,
             windows: value.windows.into_iter().map(Into::into).collect(),
         }
     }
