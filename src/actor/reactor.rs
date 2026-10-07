@@ -3081,17 +3081,11 @@ impl Reactor {
             .workspace_command_space()
             .or_else(|| spaces.iter().copied().flatten().find(|space| self.is_space_active(*space)))
         {
-            if let Some((workspace_id, workspace_name)) =
-                self.layout_manager.layout_engine.ensure_active_workspace_info(space)
-            {
-                let display_uuid = self.display_uuid_for_space(space);
-                let broadcast_event = BroadcastEvent::WorkspaceChanged {
-                    workspace_id: protocol_workspace_id(workspace_id),
-                    workspace_name,
-                    space_id: space.get(),
-                    display_uuid,
-                };
-                _ = self.communication_manager.event_broadcaster.send(broadcast_event);
+            // A snapshot that only re-confirms what the last workspace_changed reported
+            // (the echo of a switch or display focus rift just made) does not repeat it.
+            let engine = &mut self.layout_manager.layout_engine;
+            if engine.ensure_active_workspace_info(space).is_some() {
+                engine.announce_active_workspace(space);
             }
         }
     }

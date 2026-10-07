@@ -201,6 +201,8 @@ pub struct LayoutEngine {
     startup_restore_pending: bool,
     /// Legacy strip commands report boundary excess; workspace arbitration lives here.
     scroll_boundary: Option<((VirtualWorkspaceId, LayoutId, Direction), f64)>,
+    /// What the last `workspace_changed` reported: (space, workspace, name).
+    last_announced_workspace: Option<(SpaceId, VirtualWorkspaceId, String)>,
 }
 
 pub(crate) struct WorkspaceLayoutQuerySnapshot {
@@ -1602,6 +1604,7 @@ impl LayoutEngine {
             persistence: PersistenceState::default(),
             startup_restore_pending: false,
             scroll_boundary: None,
+            last_announced_workspace: None,
         }
     }
 
@@ -3660,25 +3663,35 @@ impl LayoutEngine {
     }
 
     /// Report the workspace `space` shows as a `workspace_changed`, for a change
-    /// of the focused display rather than of the workspace a display shows.
-    pub(crate) fn announce_active_workspace(&self, space: SpaceId) {
+    /// of the focused display rather than of the workspace a display shows,
+    /// unless the last `workspace_changed` reported exactly that already: the
+    /// space snapshot that follows a switch or a display focus re-confirms it.
+    /// Returns whether it reported.
+    pub(crate) fn announce_active_workspace(&mut self, space: SpaceId) -> bool {
+        let Some((workspace_id, workspace_name)) = self.active_workspace_id_and_name(space) else {
+            return false;
+        };
+        if self.last_announced_workspace.as_ref() == Some(&(space, workspace_id, workspace_name)) {
+            return false;
+        }
         self.broadcast_workspace_changed(space);
+        true
     }
 
-    fn broadcast_workspace_changed(&self, space_id: SpaceId) {
+    fn broadcast_workspace_changed(&mut self, space_id: SpaceId) {
+        let Some((workspace_id, workspace_name)) = self.active_workspace_id_and_name(space_id)
+        else {
+            return;
+        };
         if let Some(ref broadcast_tx) = self.broadcast_tx {
-            if let Some((active_workspace_id, active_workspace_name)) =
-                self.active_workspace_id_and_name(space_id)
-            {
-                let display_uuid = self.display_uuid_for_space(space_id);
-                let _ = broadcast_tx.send(BroadcastEvent::WorkspaceChanged {
-                    workspace_id: protocol_workspace_id(active_workspace_id),
-                    workspace_name: active_workspace_name.clone(),
-                    space_id: space_id.get(),
-                    display_uuid,
-                });
-            }
+            let _ = broadcast_tx.send(BroadcastEvent::WorkspaceChanged {
+                workspace_id: protocol_workspace_id(workspace_id),
+                workspace_name: workspace_name.clone(),
+                space_id: space_id.get(),
+                display_uuid: self.display_uuid_for_space(space_id),
+            });
         }
+        self.last_announced_workspace = Some((space_id, workspace_id, workspace_name));
     }
 
     fn broadcast_windows_changed(&self, window_store: &WindowStore, space_id: SpaceId) {
@@ -4847,6 +4860,49 @@ mod tests {
         assert!(response.raise_windows.is_empty());
         assert_eq!(response.focus_window, None);
         assert!(response.changed);
+    }
+
+    /// The spaces of the `workspace_changed` events on `rx` since the last call.
+    fn announced_spaces(rx: &mut crate::model::broadcast::BroadcastReceiver) -> Vec<u64> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|(_, event)| match event {
+                BroadcastEvent::WorkspaceChanged { space_id, .. } => Some(space_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn announcing_a_workspace_skips_a_repeat_of_the_last_report() {
+        let (tx, mut rx) = crate::actor::channel();
+        let mut engine = LayoutEngine::new(
+            &VirtualWorkspaceSettings::default(),
+            &LayoutSettings::default(),
+            Some(tx),
+        );
+        let mut window_store = WindowStore::default();
+        let (a, b) = (SpaceId::new(93), SpaceId::new(94));
+        for space in [a, b] {
+            let first = engine.workspaces_mut().list_workspaces(space)[0].0;
+            assert!(engine.workspaces_mut().set_active_workspace(space, first));
+        }
+
+        assert!(engine.announce_active_workspace(a));
+        assert!(!engine.announce_active_workspace(a), "a repeat stays quiet");
+        assert!(engine.announce_active_workspace(b));
+        assert!(
+            engine.announce_active_workspace(a),
+            "news again after b's report"
+        );
+        // A switch reports through the same record: its echo stays quiet.
+        let switched = engine.handle_virtual_workspace_command(
+            &mut window_store,
+            a,
+            &LayoutCommand::SwitchToWorkspace(1),
+        );
+        assert!(switched.changed);
+        assert!(!engine.announce_active_workspace(a));
+        assert_eq!(announced_spaces(&mut rx), vec![93, 94, 93, 93]);
     }
 
     #[test]
