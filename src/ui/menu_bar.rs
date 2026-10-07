@@ -1284,6 +1284,7 @@ mod layout_library_tests {
             is_active: active,
             window_count: 0,
             windows: Vec::new(),
+            display_uuid: None,
         }
     }
 

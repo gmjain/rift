@@ -380,6 +380,7 @@ mod tests {
             is_active: true,
             window_count: 1,
             windows: Vec::new(),
+            display_uuid: None,
         }
     }
 

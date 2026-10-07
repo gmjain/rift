@@ -138,6 +138,12 @@ pub struct WorkspaceData {
     pub layout_mode: String,
     pub is_active: bool,
     pub window_count: usize,
+    /// UUID of the display the workspace lives on. With per-display workspaces
+    /// the display whose workspaces were queried; with global workspaces the
+    /// display showing the workspace or holding its windows, `None` while no
+    /// display does.
+    #[serde(default)]
+    pub display_uuid: Option<String>,
     /// Workspace windows in logical column-major order when the layout has column semantics.
     /// Windows without a logical position follow in their existing stable order.
     pub windows: Vec<WindowData>,

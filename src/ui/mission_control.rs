@@ -2132,6 +2132,7 @@ mod tests {
             is_active: index == 1,
             window_count: windows.len(),
             windows,
+            display_uuid: None,
         }
     }
     fn request(id: u32) -> PreviewRequest {
