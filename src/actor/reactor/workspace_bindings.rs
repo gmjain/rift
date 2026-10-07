@@ -517,6 +517,126 @@ impl Reactor {
         Ok(outcome)
     }
 
+    /// Move workspace `index` from `source` to `target` with its layout, as
+    /// [`crate::layout_engine::LayoutEngine::rehome_workspace`] does, and carry
+    /// its windows over to the target display: each gets a frame there, rift's
+    /// picture of its native space moves, and reports of the old display are
+    /// held off while macOS catches up. Returns the windows moved.
+    fn rehome_workspace_between_spaces(
+        &mut self,
+        index: usize,
+        source: SpaceId,
+        target: SpaceId,
+        outcome: &mut EventOutcome,
+    ) -> Option<Vec<WindowId>> {
+        let target_screen = self.space_state.screen_by_space(target)?.frame;
+        let source_screen = self.space_state.screen_by_space(source).map(|screen| screen.frame);
+        let workspaces = self.layout_manager.layout_engine.workspaces_mut();
+        workspaces.ensure_space_initialized(target);
+        let source_workspace = workspaces.workspace_ids(source).get(index).copied()?;
+        let target_workspace = workspaces.workspace_ids(target).get(index).copied()?;
+        if workspaces.active_workspace(source) == Some(source_workspace) {
+            self.store_current_floating_positions(source);
+        }
+        let moved = self.layout_manager.layout_engine.rehome_workspace(
+            &mut self.state.windows,
+            (source, source_workspace),
+            (target, target_workspace),
+            (source_screen, target_screen),
+        )?;
+        for &window in &moved {
+            let Some(state) = self.state.windows.window_mut(window) else {
+                continue;
+            };
+            let frame = Self::center_frame_on_screen(state.frame_monotonic, target_screen);
+            state.frame_monotonic = frame;
+            if let Some(wsid) = state.info.sys_id {
+                self.state.windows.observe_native_space(wsid, target, true);
+            }
+            self.note_display_move_in_flight(window, target);
+            *outcome =
+                std::mem::take(outcome).with_pre_layout_window_frame_write(window, frame, true);
+        }
+        Some(moved)
+    }
+
+    /// `move_workspace_to_display` with global workspaces: the workspace `source`
+    /// shows moves to `target` with its layout and is shown there; `source` goes
+    /// back to its last own workspace, else to one it may show.
+    pub(crate) fn move_workspace_to_display_keeping_layout(
+        &mut self,
+        source: SpaceId,
+        target: SpaceId,
+        target_screen: &ScreenInfo,
+    ) -> anyhow::Result<EventOutcome> {
+        let Some(index) = self.active_workspace_index(source) else {
+            return Ok(EventOutcome::no_change());
+        };
+        let mut outcome = EventOutcome::layout_changed(false);
+        if self
+            .rehome_workspace_between_spaces(index, source, target, &mut outcome)
+            .is_none()
+        {
+            warn!(
+                index,
+                "Move workspace to display ignored: the target's copy is in use"
+            );
+            return Ok(EventOutcome::no_change());
+        }
+        self.layout_manager
+            .layout_engine
+            .workspaces_mut()
+            .clear_home_display(target, index);
+        // The workspace the target shows now becomes free once it switches, unless
+        // it holds windows: then the target keeps it.
+        let freed = self.active_workspace_index(target).filter(|freed| {
+            let workspaces = self.layout_manager.layout_engine.workspaces();
+            workspaces
+                .workspace_ids(target)
+                .get(*freed)
+                .is_none_or(|copy| self.state.windows.workspace_window_count(target, *copy) == 0)
+        });
+        if let Some(fallback) = self.fallback_workspace_for_display(source, index, freed) {
+            outcome.absorb(
+                self.dispatch_layout_command_on(
+                    LayoutCommand::SwitchToWorkspace(fallback),
+                    source,
+                )?,
+            );
+        }
+        outcome.absorb(
+            self.dispatch_layout_command_on(LayoutCommand::SwitchToWorkspace(index), target)?,
+        );
+        self.workspace_switch_manager
+            .start_workspace_switch(super::WorkspaceSwitchOrigin::Manual);
+        self.adopt_display_context(target_screen);
+        Ok(outcome)
+    }
+
+    /// The workspace `space` shows once workspace `leaving` left it: its
+    /// back-and-forth target if that is its own, else the first workspace it
+    /// owns or nobody owns. `freed` is a workspace about to lose its owner.
+    fn fallback_workspace_for_display(
+        &self,
+        space: SpaceId,
+        leaving: usize,
+        freed: Option<usize>,
+    ) -> Option<usize> {
+        let may_show = |index: usize| {
+            index != leaving
+                && (freed == Some(index)
+                    || self
+                        .owner_space_for_workspace_index(index)
+                        .is_none_or(|owner| owner == space))
+        };
+        let workspaces = self.layout_manager.layout_engine.workspaces();
+        workspaces
+            .last_workspace(space)
+            .and_then(|last| self.workspace_ordinal(space, last))
+            .filter(|index| may_show(*index))
+            .or_else(|| (0..workspaces.workspace_count()).find(|index| may_show(*index)))
+    }
+
     /// Whether a window sits in a workspace bound to the display now showing `space`.
     pub(crate) fn window_returns_to_bound_display(&self, wid: WindowId, space: SpaceId) -> bool {
         let Some(assignment) = self.state.windows.workspace_info_for_window(wid) else {

@@ -8816,3 +8816,156 @@ fn global_workspaces_share_one_back_and_forth_target() {
     assert_eq!(active_workspace_index_of(&reactor, right_space), Some(2));
     assert_eq!(active_workspace_index_of(&reactor, left_space), Some(3));
 }
+
+/// Tiled frames of the windows `space` shows, shifted by `dx` so that two
+/// displays of the same size can be compared.
+fn layout_shifted(
+    reactor: &mut Reactor,
+    space: SpaceId,
+    screen: CGRect,
+    dx: f64,
+) -> Vec<(WindowId, CGRect)> {
+    let mut layout: Vec<_> = test_layout(reactor, space, screen)
+        .into_iter()
+        .map(|(wid, frame)| {
+            (
+                wid,
+                CGRect::new(CGPoint::new(frame.origin.x + dx, frame.origin.y), frame.size),
+            )
+        })
+        .collect();
+    layout.sort_by_key(|(wid, _)| *wid);
+    layout
+}
+
+#[test]
+fn global_workspaces_move_a_workspace_to_another_display_with_its_layout() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    apps.make_app_and_settle(&mut reactor, 2, make_windows(1));
+    let windows = [
+        WindowId::new(1, 1),
+        WindowId::new(1, 2),
+        WindowId::new(2, 1),
+    ];
+    // Arrange ws0 in an order re-inserting its windows would not reproduce.
+    reactor.handle_test_layout_command(LayoutCommand::MoveNode(Direction::Left));
+    reactor.handle_test_layout_command(LayoutCommand::MoveNode(Direction::Left));
+    apps.simulate_until_quiet(&mut reactor);
+    let before = layout_shifted(&mut reactor, left_space, left_screen(), 1000.);
+    assert_eq!(before.len(), 3);
+
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWorkspaceToDisplay {
+            selector: DisplaySelector::Index(1),
+            wrap_around: false,
+        },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(
+        active_workspace_index_of(&reactor, right_space),
+        Some(0),
+        "the right display shows the workspace"
+    );
+    assert_eq!(
+        active_workspace_index_of(&reactor, left_space),
+        Some(1),
+        "the left display shows the first workspace nobody owns"
+    );
+    assert_eq!(reactor.space_state.command_space, Some(right_space));
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    for window in windows {
+        assert_eq!(reactor.assigned_space_for_window_id(window), Some(right_space));
+        assert_eq!(
+            reactor.test_workspace_for_window(right_space, window),
+            Some(right_workspaces[0])
+        );
+        let frame = reactor.state.windows.window(window).unwrap().frame_monotonic;
+        assert!(
+            frame.origin.x >= 1000.,
+            "{window:?} sits on the right display: {frame:?}"
+        );
+    }
+    let after = layout_shifted(&mut reactor, right_space, right_screen(), 0.);
+    assert_eq!(after, before, "the layout moved with the workspace");
+    assert!(test_layout(&mut reactor, left_space, left_screen()).is_empty());
+
+    // A report that still has a window on the old display lags the move and
+    // does not pull it back.
+    let reports: Vec<_> = windows
+        .iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let space = if i == 0 { left_space } else { right_space };
+            (reactor.test_window_server_id(*window), Some(space))
+        })
+        .collect();
+    reactor.reconcile_authoritative_active_window_snapshot(reports, false, &[]);
+    for window in windows {
+        assert_eq!(reactor.assigned_space_for_window_id(window), Some(right_space));
+        assert_eq!(
+            reactor.test_workspace_for_window(right_space, window),
+            Some(right_workspaces[0])
+        );
+    }
+
+    // Back and forth: the left display takes it again, and the right one goes
+    // back to its last workspace.
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWorkspaceToDisplay {
+            selector: DisplaySelector::Index(0),
+            wrap_around: false,
+        },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+    let left_workspaces = reactor.test_workspace_ids(left_space);
+    for window in windows {
+        assert_eq!(
+            reactor.test_workspace_for_window(left_space, window),
+            Some(left_workspaces[0])
+        );
+    }
+    assert_eq!(
+        layout_shifted(&mut reactor, left_space, left_screen(), 1000.),
+        before
+    );
+}
+
+#[test]
+fn global_workspaces_moving_a_workspace_leaves_the_target_its_workspace_with_windows() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    // The right display shows ws1 with a window; the left one, with ws0, has
+    // no back-and-forth target yet.
+    let mut window = make_window(1);
+    window.frame = CGRect::new(CGPoint::new(1200., 100.), CGSize::new(400., 400.));
+    apps.make_app_and_settle(&mut reactor, 2, vec![window]);
+    let on_right = WindowId::new(2, 1);
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    focus_display_space(&mut reactor, left_space);
+
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWorkspaceToDisplay {
+            selector: DisplaySelector::Index(1),
+            wrap_around: false,
+        },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(0));
+    assert_eq!(
+        active_workspace_index_of(&reactor, left_space),
+        Some(2),
+        "the left display shows the first workspace nobody owns, not ws1"
+    );
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, on_right),
+        Some(right_workspaces[1]),
+        "ws1 keeps its window on the right display"
+    );
+}

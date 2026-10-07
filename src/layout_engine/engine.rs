@@ -19,7 +19,7 @@ use crate::model::broadcast::{BroadcastEvent, BroadcastSender, protocol_workspac
 use crate::model::virtual_workspace::{VirtualWorkspaceId, WorkspaceStore};
 use crate::model::{
     AppRuleEffects, AppRuleEngine, AppRuleResult, FloatingPositionStore, WindowRuleContext,
-    WindowStore,
+    WindowStore, WindowWorkspaceInfo,
 };
 use crate::sys::screen::SpaceId;
 
@@ -154,6 +154,20 @@ pub struct EventResponse {
     pub raise_windows: Vec<WindowId>,
     pub focus_window: Option<WindowId>,
     pub boundary_hit: Option<Direction>,
+}
+
+/// Keep a frame's position relative to its screen's top-left corner on another
+/// screen, pulled inside that screen where it would hang off it.
+pub(crate) fn translate_frame_between_screens(frame: CGRect, from: CGRect, to: CGRect) -> CGRect {
+    let width = frame.size.width.min(to.size.width);
+    let height = frame.size.height.min(to.size.height);
+    let x = (to.origin.x + frame.origin.x - from.origin.x)
+        .min(to.origin.x + to.size.width - width)
+        .max(to.origin.x);
+    let y = (to.origin.y + frame.origin.y - from.origin.y)
+        .min(to.origin.y + to.size.height - height)
+        .max(to.origin.y);
+    CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))
 }
 
 #[must_use]
@@ -3324,6 +3338,67 @@ impl LayoutEngine {
         self.workspaces.ensure_space_initialized(space);
         self.sync_scrolling_widths_for_space(space);
         self.workspaces.ensure_layouts_for_size(space, screen_size);
+    }
+
+    /// Move a workspace from one display's copy to another display's empty copy
+    /// at the same position, keeping its layout: the windows, tiled and parked,
+    /// change assignment, the layout trees and focus memory move with them, and
+    /// stored floating frames are translated onto the target screen. Returns
+    /// the windows now assigned to `target`, or `None` when the target copy is
+    /// not empty.
+    ///
+    /// Workspace activation and window frames are the caller's business.
+    pub fn rehome_workspace(
+        &mut self,
+        window_store: &mut WindowStore,
+        source: (SpaceId, VirtualWorkspaceId),
+        target: (SpaceId, VirtualWorkspaceId),
+        screens: (Option<CGRect>, CGRect),
+    ) -> Option<Vec<WindowId>> {
+        let (source_space, source_workspace) = source;
+        let (target_space, target_workspace) = target;
+        let (source_screen, target_screen) = screens;
+        if source_space == target_space
+            || self.workspaces.workspaces.get(source_workspace)?.space != source_space
+            || self.workspaces.workspaces.get(target_workspace)?.space != target_space
+            || window_store.workspace_window_count(target_space, target_workspace) > 0
+        {
+            return None;
+        }
+        let windows = window_store.workspace_windows(source_space, source_workspace);
+        if !self.workspaces.swap_workspace_payloads(source_workspace, target_workspace) {
+            return None;
+        }
+        for &window in &windows {
+            window_store.assign_window_to_workspace(window, WindowWorkspaceInfo {
+                space: target_space,
+                workspace_id: target_workspace,
+            });
+            if self.floating.is_floating(window) {
+                self.floating.remove_active_for_window(window);
+            }
+            let stored = self.floating_positions.get(source_space, source_workspace, window);
+            self.floating_positions
+                .remove_workspace_window(source_space, source_workspace, window);
+            if let Some(frame) = stored {
+                let frame = match source_screen {
+                    Some(source_screen) => {
+                        translate_frame_between_screens(frame, source_screen, target_screen)
+                    }
+                    None => frame,
+                };
+                self.floating_positions.store(target_space, target_workspace, window, frame);
+            }
+        }
+        self.ensure_workspace_layouts(target_space, target_screen.size);
+        if self.focused_window.is_some_and(|focused| windows.contains(&focused)) {
+            self.focused_window = None;
+        }
+        self.update_active_floating_windows(window_store, source_space);
+        self.update_active_floating_windows(window_store, target_space);
+        self.broadcast_windows_changed(window_store, source_space);
+        self.broadcast_windows_changed(window_store, target_space);
+        Some(windows)
     }
 
     fn relocate_window_to_workspace(
