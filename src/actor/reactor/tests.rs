@@ -9585,3 +9585,162 @@ fn global_workspaces_app_rules_place_windows_on_the_display_owning_their_workspa
         Some(left_workspaces[3])
     );
 }
+
+/// Tiled frames of workspace `index` on `space`, shown or not, shifted by `dx`.
+fn workspace_layout_shifted(
+    reactor: &mut Reactor,
+    space: SpaceId,
+    index: usize,
+    screen: CGRect,
+    dx: f64,
+) -> Vec<(WindowId, CGRect)> {
+    let workspace = reactor.test_workspace_ids(space)[index];
+    let gaps = reactor.config.settings.layout.gaps.clone();
+    let mut layout: Vec<_> = reactor
+        .layout_manager
+        .layout_engine
+        .calculate_layout_for_workspace(
+            &reactor.state.windows,
+            space,
+            workspace,
+            screen,
+            &gaps,
+            0.0,
+            crate::common::config::HorizontalPlacement::Top,
+            crate::common::config::VerticalPlacement::Right,
+        )
+        .into_iter()
+        .map(|(wid, frame)| {
+            (
+                wid,
+                CGRect::new(CGPoint::new(frame.origin.x + dx, frame.origin.y), frame.size),
+            )
+        })
+        .collect();
+    layout.sort_by_key(|(wid, _)| *wid);
+    layout
+}
+
+#[test]
+fn global_workspaces_follow_a_display_that_goes_away_and_return_when_it_is_back() {
+    let (mut apps, mut reactor, left_space, right_space) =
+        two_display_global_reactor(global_workspace_settings(4));
+    // The right display shows ws1 with two windows in an arranged layout, and
+    // holds ws2 with a parked window.
+    focus_display_space(&mut reactor, right_space);
+    let shown = open_window_on_right(&mut apps, &mut reactor, 2);
+    let also_shown = open_window_on_right(&mut apps, &mut reactor, 3);
+    // (Leftwards would carry the window onto the left display.)
+    reactor.handle_test_layout_command(LayoutCommand::MoveNode(Direction::Right));
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(2));
+    let parked = open_window_on_right(&mut apps, &mut reactor, 4);
+    reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    apps.simulate_until_quiet(&mut reactor);
+    let right_workspaces = reactor.test_workspace_ids(right_space);
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(
+        reactor.test_workspace_for_window(right_space, parked),
+        Some(right_workspaces[2])
+    );
+    let before = workspace_layout_shifted(&mut reactor, right_space, 1, right_screen(), -1000.);
+    assert_eq!(before.len(), 2);
+    focus_display_space(&mut reactor, left_space);
+
+    // Unplugged: macOS moves every window of the right display onto the left one.
+    let windows = [
+        WindowId::new(1, 1),
+        WindowId::new(1, 2),
+        shown,
+        also_shown,
+        parked,
+    ];
+    let wsids: Vec<_> = windows.iter().map(|wid| reactor.test_window_server_id(*wid)).collect();
+    report_windows_on(&reactor, left_space, &windows);
+    reactor.handle_event(space_state_event_with(
+        vec![left_screen()],
+        vec![Some(left_space)],
+        |state| {
+            state.display_set_changed = true;
+            state.should_force_refresh_layout = true;
+            state.membership_complete = true;
+            for wsid in &wsids {
+                state.active_window_spaces.insert(*wsid, left_space);
+            }
+        },
+    ));
+    apps.simulate_until_quiet(&mut reactor);
+
+    let left_workspaces = reactor.test_workspace_ids(left_space);
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    for (window, index) in [(shown, 1), (also_shown, 1), (parked, 2)] {
+        assert_eq!(reactor.assigned_space_for_window_id(window), Some(left_space));
+        assert_eq!(
+            reactor.test_workspace_for_window(left_space, window),
+            Some(left_workspaces[index]),
+            "{window:?} keeps its workspace on the remaining display"
+        );
+    }
+    assert_eq!(
+        workspace_layout_shifted(&mut reactor, left_space, 1, left_screen(), 0.),
+        before,
+        "the layout moved with the workspace"
+    );
+    let workspaces = reactor.layout_manager.layout_engine.workspaces();
+    assert_eq!(
+        workspaces.home_display(left_space, 1),
+        Some(("test-display-1", true))
+    );
+    assert_eq!(
+        workspaces.home_display(left_space, 2),
+        Some(("test-display-1", false))
+    );
+    assert_eq!(workspaces.home_display(left_space, 0), None);
+
+    // Plugged back in: the workspaces go home, and the display shows the one
+    // it was showing.
+    reactor.handle_event(space_state_event_with(
+        vec![left_screen(), right_screen()],
+        vec![Some(left_space), Some(right_space)],
+        |state| {
+            state.display_set_changed = true;
+            state.should_force_refresh_layout = true;
+            state.membership_complete = true;
+            for wsid in &wsids {
+                state.active_window_spaces.insert(*wsid, left_space);
+            }
+        },
+    ));
+    apps.simulate_until_quiet(&mut reactor);
+
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(1));
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    for (window, index) in [(shown, 1), (also_shown, 1), (parked, 2)] {
+        assert_eq!(reactor.assigned_space_for_window_id(window), Some(right_space));
+        assert_eq!(
+            reactor.test_workspace_for_window(right_space, window),
+            Some(right_workspaces[index]),
+            "{window:?} is back in its workspace on its display"
+        );
+        let frame = reactor.state.windows.window(window).unwrap().frame_monotonic;
+        assert!(
+            frame.origin.x >= 1000.,
+            "{window:?} sits on the right display: {frame:?}"
+        );
+    }
+    assert_eq!(
+        workspace_layout_shifted(&mut reactor, right_space, 1, right_screen(), -1000.),
+        before
+    );
+    for index in 0..4 {
+        for space in [left_space, right_space] {
+            assert_eq!(
+                reactor.layout_manager.layout_engine.workspaces().home_display(space, index),
+                None
+            );
+        }
+    }
+    for window in [WindowId::new(1, 1), WindowId::new(1, 2)] {
+        assert_eq!(reactor.assigned_space_for_window_id(window), Some(left_space));
+    }
+    clear_window_reports(&reactor, &[left_space, right_space], &windows);
+}

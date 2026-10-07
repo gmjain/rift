@@ -66,6 +66,9 @@ pub struct VirtualWorkspace {
     /// returns. Absent in layout files written before the setting existed.
     #[serde(default)]
     pub(crate) home_display: Option<String>,
+    /// Whether the home display was showing this workspace when it went away.
+    #[serde(default)]
+    pub(crate) shown_on_home_display: bool,
 }
 
 fn default_layout_system_kind() -> LayoutSystemKind {
@@ -83,6 +86,7 @@ impl VirtualWorkspace {
             layout_mode: mode,
             layout_state: WorkspaceLayoutState::default(),
             home_display: None,
+            shown_on_home_display: false,
         }
     }
 
@@ -168,6 +172,7 @@ impl VirtualWorkspace {
             layout_state: std::mem::take(&mut self.layout_state),
             last_focused: self.last_focused.take(),
             home_display: self.home_display.take(),
+            shown_on_home_display: std::mem::take(&mut self.shown_on_home_display),
         }
     }
 
@@ -177,6 +182,7 @@ impl VirtualWorkspace {
         self.layout_state = payload.layout_state;
         self.last_focused = payload.last_focused;
         self.home_display = payload.home_display;
+        self.shown_on_home_display = payload.shown_on_home_display;
     }
 }
 
@@ -188,6 +194,7 @@ struct WorkspacePayload {
     layout_state: WorkspaceLayoutState,
     last_focused: Option<WindowId>,
     home_display: Option<String>,
+    shown_on_home_display: bool,
 }
 
 /// Owns virtual workspace topology and workspace-scoped layout configurations.
@@ -544,11 +551,38 @@ impl WorkspaceStore {
     pub(crate) fn global_last_workspace(&self) -> Option<usize> { self.global_last_workspace }
 
     /// Forget where workspace `index` of `space` lived before its display went
-    /// away: the user put it somewhere on purpose.
+    /// away: the user put it somewhere on purpose, or it is back.
     pub(crate) fn clear_home_display(&mut self, space: SpaceId, index: usize) {
         if let Some(id) = self.workspace_ids(space).get(index).copied() {
             self.workspaces[id].home_display = None;
+            self.workspaces[id].shown_on_home_display = false;
         }
+    }
+
+    /// Remember that workspace `index` of `space` lived on display `home`
+    /// (by UUID) until that display went away, and whether it was showing.
+    pub(crate) fn set_home_display(
+        &mut self,
+        space: SpaceId,
+        index: usize,
+        home: String,
+        shown: bool,
+    ) {
+        if let Some(id) = self.workspace_ids(space).get(index).copied() {
+            self.workspaces[id].home_display = Some(home);
+            self.workspaces[id].shown_on_home_display = shown;
+        }
+    }
+
+    /// The display workspace `index` of `space` is waiting to return to, and
+    /// whether that display was showing it.
+    pub(crate) fn home_display(&self, space: SpaceId, index: usize) -> Option<(&str, bool)> {
+        let id = self.workspace_ids(space).get(index).copied()?;
+        let workspace = &self.workspaces[id];
+        Some((
+            workspace.home_display.as_deref()?,
+            workspace.shown_on_home_display,
+        ))
     }
 
     /// The number of workspaces each native space holds: the configured count,
@@ -1803,6 +1837,31 @@ mod tests {
         assert_eq!(restored.global_last_workspace(), Some(2));
         restored.note_focused_workspace(1);
         assert_eq!(restored.global_last_workspace(), Some(0));
+    }
+
+    #[test]
+    fn home_display_persists_and_is_optional_in_older_layout_files() {
+        let mut store = WorkspaceStore::new();
+        let space = SpaceId::new(1);
+        store.ensure_space_initialized(space);
+        store.set_home_display(space, 1, "home".into(), true);
+        assert_eq!(store.home_display(space, 1), Some(("home", true)));
+        assert_eq!(store.home_display(space, 0), None);
+
+        let serialized = ron::ser::to_string(&store).unwrap();
+        let restored: WorkspaceStore = ron::from_str(&serialized).unwrap();
+        assert_eq!(restored.home_display(space, 1), Some(("home", true)));
+
+        let older = regex::Regex::new(r#",home_display:[^,]*,shown_on_home_display:(true|false)"#)
+            .unwrap()
+            .replace_all(&serialized, "")
+            .into_owned();
+        assert_ne!(older, serialized);
+        let restored: WorkspaceStore = ron::from_str(&older).unwrap();
+        assert_eq!(restored.home_display(space, 1), None);
+
+        store.clear_home_display(space, 1);
+        assert_eq!(store.home_display(space, 1), None);
     }
 
     #[test]

@@ -683,6 +683,169 @@ impl Reactor {
             .or_else(|| (0..workspaces.workspace_count()).find(|index| may_show(*index)))
     }
 
+    /// Displays in the current display set that `screens`, the next one, no
+    /// longer has, with the user Space holding their workspaces.
+    pub(crate) fn vanished_displays(&self, screens: &[ScreenInfo]) -> Vec<(String, SpaceId)> {
+        if !self.has_global_workspaces() {
+            return Vec::new();
+        }
+        self.space_state
+            .screens
+            .iter()
+            .filter(|old| !screens.iter().any(|new| new.display_uuid == old.display_uuid))
+            .filter_map(|old| {
+                Some((old.display_uuid.clone(), self.workspace_space_of_screen(old)?))
+            })
+            .collect()
+    }
+
+    /// Carry the workspaces a display that went away owned over to the display
+    /// macOS moved their windows to, with their layouts, and remember where
+    /// they came from so they can go back when the display returns. Runs on
+    /// the snapshot that drops the display, before its windows are reconciled.
+    pub(crate) fn rehome_workspaces_of_vanished_displays(
+        &mut self,
+        vanished: Vec<(String, SpaceId)>,
+    ) -> EventOutcome {
+        let mut outcome = EventOutcome::no_change();
+        let remaining: Vec<SpaceId> = physical_order(&self.space_state.screens)
+            .into_iter()
+            .filter_map(|screen| screen.space)
+            .filter(|space| vanished.iter().all(|(_, gone)| gone != space))
+            .collect();
+        if remaining.is_empty() {
+            return outcome;
+        }
+        for (display_uuid, gone) in vanished {
+            let workspaces = self.layout_manager.layout_engine.workspaces();
+            let shown = workspaces.active_workspace(gone);
+            let owned: Vec<(usize, VirtualWorkspaceId)> = workspaces
+                .workspace_ids(gone)
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, copy)| {
+                    shown == Some(*copy)
+                        || self.state.windows.workspace_window_count(gone, *copy) > 0
+                })
+                .collect();
+            for (index, copy) in owned {
+                let target =
+                    self.space_windows_landed_on(gone, copy, &remaining).unwrap_or(remaining[0]);
+                if self
+                    .rehome_workspace_between_spaces(index, gone, target, &mut outcome)
+                    .is_none()
+                {
+                    warn!(
+                        index,
+                        ?target,
+                        "a workspace of a disconnected display could not move"
+                    );
+                    continue;
+                }
+                self.layout_manager.layout_engine.workspaces_mut().set_home_display(
+                    target,
+                    index,
+                    display_uuid.clone(),
+                    shown == Some(copy),
+                );
+            }
+        }
+        outcome
+    }
+
+    /// Among `candidates`, the native space the snapshot reports most of the
+    /// windows of workspace `copy` on.
+    fn space_windows_landed_on(
+        &self,
+        space: SpaceId,
+        copy: VirtualWorkspaceId,
+        candidates: &[SpaceId],
+    ) -> Option<SpaceId> {
+        let mut tally: Vec<(SpaceId, usize)> = candidates.iter().map(|space| (*space, 0)).collect();
+        for window in self.state.windows.workspace_windows(space, copy) {
+            let Some(wsid) = self.state.windows.window(window).and_then(|state| state.info.sys_id)
+            else {
+                continue;
+            };
+            if let Some(reported) = self.space_state.active_window_spaces.get(&wsid)
+                && let Some(entry) = tally.iter_mut().find(|(space, _)| space == reported)
+            {
+                entry.1 += 1;
+            }
+        }
+        tally
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .max_by_key(|(_, count)| *count)
+            .map(|(space, _)| space)
+    }
+
+    /// Give displays that came back the workspaces that lived on them when they
+    /// went away, and show them the one they were showing.
+    fn return_workspaces_to_home_displays(&mut self, outcome: &mut EventOutcome) -> bool {
+        if !self.has_global_workspaces() {
+            return false;
+        }
+        let mut changed = false;
+        for screen in physical_order(&self.space_state.screens)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let Some(home) = screen.space.filter(|space| self.is_space_active(*space)) else {
+                continue;
+            };
+            let count = self.layout_manager.layout_engine.workspaces().workspace_count();
+            let mut show = None;
+            for index in 0..count {
+                let workspaces = self.layout_manager.layout_engine.workspaces();
+                let Some((away, shown)) = workspaces
+                    .initialized_spaces()
+                    .into_iter()
+                    .filter(|space| *space != home)
+                    .find_map(|space| {
+                        let (uuid, shown) = workspaces.home_display(space, index)?;
+                        (uuid == screen.display_uuid).then_some((space, shown))
+                    })
+                else {
+                    continue;
+                };
+                let leaving_visible = self.active_workspace_index(away) == Some(index);
+                if self.rehome_workspace_between_spaces(index, away, home, outcome).is_none() {
+                    continue;
+                }
+                changed = true;
+                self.layout_manager
+                    .layout_engine
+                    .workspaces_mut()
+                    .clear_home_display(home, index);
+                if leaving_visible
+                    && let Some(fallback) = self.fallback_workspace_for_display(away, index, None)
+                {
+                    match self.dispatch_layout_command_on(
+                        LayoutCommand::SwitchToWorkspace(fallback),
+                        away,
+                    ) {
+                        Ok(switched) => outcome.absorb(switched),
+                        Err(error) => warn!(%error, "failed to leave a workspace that went home"),
+                    }
+                }
+                if shown && show.is_none() {
+                    show = Some(index);
+                }
+            }
+            if let Some(index) = show {
+                match self.dispatch_layout_command_on(LayoutCommand::SwitchToWorkspace(index), home)
+                {
+                    Ok(switched) => outcome.absorb(switched),
+                    Err(error) => warn!(%error, "failed to show a workspace that came home"),
+                }
+            }
+        }
+        changed
+    }
+
     /// Whether a window sits in a workspace bound to the display now showing `space`.
     pub(crate) fn window_returns_to_bound_display(&self, wid: WindowId, space: SpaceId) -> bool {
         let Some(assignment) = self.state.windows.workspace_info_for_window(wid) else {
@@ -720,9 +883,13 @@ impl Reactor {
             self.bindings_need_check = false;
             self.settle_global_workspaces();
             let mut outcome = EventOutcome::no_change();
+            let returned = self.return_workspaces_to_home_displays(&mut outcome);
+            if returned {
+                self.settle_global_workspaces();
+            }
             let normalized = self.normalize_bound_active_workspaces(&mut outcome);
             let rehomed = self.rehome_bound_windows(&mut outcome);
-            if normalized || rehomed {
+            if returned || normalized || rehomed {
                 self.apply_event_outcome(outcome);
             }
         }
