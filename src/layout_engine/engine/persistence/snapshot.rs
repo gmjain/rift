@@ -91,6 +91,13 @@ impl PersistedLayout {
             }
             workspace.layout_state = state;
         }
+        let repaired = self.workspaces.repair_layout_memberships();
+        if repaired > 0 {
+            tracing::warn!(
+                repaired,
+                "persisted layout held a window in more than one leaf; dropped the extra leaves"
+            );
+        }
         self.workspaces
             .validate_layouts()
             .map_err(|error| anyhow::anyhow!("invalid workspace layouts: {error}"))

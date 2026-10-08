@@ -214,8 +214,13 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     }
     /// Replace a window identity in-place without changing its layout position.
     fn replace_window(&mut self, from: WindowId, to: WindowId);
+    /// Remove `wid` from every layout of this system. A window has at most one leaf per
+    /// layout; removing it leaves none behind in any layout, shown or not.
     fn remove_window(&mut self, wid: WindowId);
     fn remove_window_and_rebalance_parent(&mut self, wid: WindowId) { self.remove_window(wid) }
+    /// Drop leaves that repeat a window within one layout (a loaded file may carry them).
+    /// Returns how many were removed.
+    fn repair_memberships(&mut self) -> usize { 0 }
     fn remove_windows_for_app(&mut self, pid: pid_t);
     fn windows_for_app(&self, layout: LayoutId, pid: pid_t) -> Vec<WindowId> {
         self.all_windows_in_layout(layout)

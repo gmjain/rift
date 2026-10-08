@@ -270,13 +270,46 @@ impl BspLayoutSystem {
     }
 
     fn node_for_window_mut(&mut self, wid: WindowId) -> Option<NodeId> {
-        let node = self.window_to_node.get(&wid).copied()?;
-        if matches!(self.kind.get(node), Some(NodeKind::Leaf { .. })) {
-            Some(node)
-        } else {
+        if let Some(node) = self.window_to_node.get(&wid).copied() {
+            if matches!(self.kind.get(node), Some(NodeKind::Leaf { .. })) {
+                return Some(node);
+            }
             self.unindex_window(wid);
-            None
         }
+        // The index is a hint: a window cloned into a second layout, or one whose index
+        // was dropped with another leaf, is still found by walking the layouts.
+        let node = self
+            .layouts
+            .keys()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .find_map(|layout| self.node_for_window_in_layout(layout, wid))?;
+        self.index_window(wid, node);
+        Some(node)
+    }
+
+    /// Remove every leaf (or stack membership) `wid` has in `layout`.
+    fn remove_window_from_layout(&mut self, layout: crate::layout_engine::LayoutId, wid: WindowId) {
+        // A window occurs once per layout; the bound only guards against a removal that
+        // leaves the node in place.
+        for _ in 0..64 {
+            if self.node_for_window_in_layout(layout, wid).is_none() {
+                return;
+            }
+            self.remove_window_internal(layout, wid);
+        }
+    }
+
+    /// How many leaves (counting stack members) of `layout` hold each window.
+    fn window_occurrences(&self, layout: crate::layout_engine::LayoutId) -> Vec<(WindowId, usize)> {
+        let mut counts: Vec<(WindowId, usize)> = Vec::new();
+        for window in self.all_windows_in_layout(layout) {
+            match counts.iter_mut().find(|(seen, _)| *seen == window) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((window, 1)),
+            }
+        }
+        counts
     }
 
     fn make_leaf(&mut self, window: Option<WindowId>) -> NodeId {
@@ -870,6 +903,85 @@ mod tests {
         system.set_windows_for_app(first, w(1).pid, vec![w(1)]);
         assert_eq!(system.all_windows_in_layout(first), vec![w(1)]);
         assert_eq!(system.all_windows_in_layout(second), vec![w(1)]);
+    }
+
+    #[test]
+    fn adding_a_window_already_in_the_layout_keeps_its_one_leaf() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        system.add_window_after_selection(layout, w(1));
+
+        assert_eq!(
+            system.all_windows_in_layout(layout),
+            vec![w(1), w(2)],
+            "a second leaf would get its own frame on every layout pass"
+        );
+    }
+
+    #[test]
+    fn removing_a_window_clears_every_layout_of_the_system() {
+        let mut system = BspLayoutSystem::default();
+        let first = system.create_layout();
+        system.add_window_after_selection(first, w(1));
+        system.add_window_after_selection(first, w(2));
+        // The layout for a second display size: the index now points into the clone.
+        let second = system.clone_layout(first);
+        assert!(system.contains_window(second, w(1)));
+
+        system.remove_window(w(1));
+
+        assert!(
+            !system.contains_window(first, w(1)),
+            "the leaf the index no longer points at comes back as a phantom when this size is shown again"
+        );
+        assert!(!system.contains_window(second, w(1)));
+        assert_eq!(system.all_windows_in_layout(first), vec![w(2)]);
+        assert_eq!(system.all_windows_in_layout(second), vec![w(2)]);
+    }
+
+    #[test]
+    fn replacing_a_window_renames_it_in_every_layout_of_the_system() {
+        let mut system = BspLayoutSystem::default();
+        let first = system.create_layout();
+        system.add_window_after_selection(first, w(1));
+        system.add_window_after_selection(first, w(2));
+        // The layout for a second display size: the index now points into the clone.
+        let second = system.clone_layout(first);
+
+        // A native tab switch: the incoming tab takes the outgoing one's slot.
+        system.replace_window(w(1), w(3));
+
+        assert_eq!(
+            system.all_windows_in_layout(first),
+            vec![w(3), w(2)],
+            "a leaf still naming the old tab is an empty slot when this size is shown again"
+        );
+        assert_eq!(system.all_windows_in_layout(second), vec![w(3), w(2)]);
+        system.remove_window(w(3));
+        assert_eq!(system.all_windows_in_layout(first), vec![w(2)]);
+        assert_eq!(system.all_windows_in_layout(second), vec![w(2)]);
+    }
+
+    #[test]
+    fn repair_memberships_drops_leaves_that_repeat_a_window() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        // A layout file written while leaves could repeat: w(1) split off w(2) again.
+        system.insert_window_at_selection(layout, w(1));
+        assert_eq!(system.all_windows_in_layout(layout), vec![w(1), w(2), w(1)]);
+
+        assert_eq!(system.repair_memberships(), 1);
+
+        assert_eq!(system.all_windows_in_layout(layout), vec![w(2), w(1)]);
+        assert_eq!(system.repair_memberships(), 0);
+        assert!(system.contains_window(layout, w(1)));
+        system.remove_window(w(1));
+        assert_eq!(system.all_windows_in_layout(layout), vec![w(2)]);
     }
 
     #[test]
@@ -1490,6 +1602,11 @@ impl LayoutSystem for BspLayoutSystem {
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
         if self.layouts.get(layout).is_some() {
+            // One leaf per window and layout: a window already here keeps its place. A
+            // second leaf would get its own frame on every layout pass and fight the first.
+            if self.node_for_window_in_layout(layout, wid).is_some() {
+                return;
+            }
             if self.window_insertion_point == WindowInsertionPoint::EndOfTree {
                 let root = self.layouts[layout].root;
                 if let Some(leaf) = root
@@ -1514,40 +1631,63 @@ impl LayoutSystem for BspLayoutSystem {
         if from == to {
             return;
         }
-        let Some(node) = self.window_to_node.remove(&from) else {
-            return;
-        };
-        if let Some(stack) = self.stacks.get_mut(&node)
-            && let Some(member) = stack.iter_mut().find(|window| **window == from)
-        {
-            *member = to;
-            if let Some(NodeKind::Leaf { window, .. }) = self.kind.get_mut(node)
-                && *window == Some(from)
-            {
-                *window = Some(to);
+        // Every layout of this workspace, as in remove_window: the per-display-size layouts
+        // mirror each other, and a leaf still naming `from` in an inactive one comes back as
+        // a slot for a window that is gone (a native tab switch renames its slot at runtime).
+        let indexed = self.window_to_node.remove(&from);
+        let layouts: Vec<_> = self.layouts.keys().collect();
+        let mut renamed = Vec::new();
+        for layout in layouts {
+            while let Some(node) = self.node_for_window_in_layout(layout, from) {
+                if let Some(stack) = self.stacks.get_mut(&node) {
+                    for member in stack.iter_mut().filter(|member| **member == from) {
+                        *member = to;
+                    }
+                }
+                if let Some(NodeKind::Leaf { window, .. }) = self.kind.get_mut(node)
+                    && *window == Some(from)
+                {
+                    *window = Some(to);
+                }
+                renamed.push(node);
             }
-            self.window_to_node.insert(to, node);
-            return;
         }
-        if let Some(NodeKind::Leaf { window, .. }) = self.kind.get_mut(node)
-            && *window == Some(from)
+        // The index keeps pointing into the layout it pointed into.
+        if let Some(node) = indexed
+            .filter(|node| renamed.contains(node))
+            .or_else(|| renamed.first().copied())
         {
-            *window = Some(to);
-            self.window_to_node.insert(to, node);
+            self.index_window(to, node);
         }
     }
 
     fn remove_window(&mut self, wid: WindowId) {
-        if let Some(node_id) = self.node_for_window_mut(wid) {
-            let root = self.find_layout_root(node_id);
-            let layout = self
-                .layouts
-                .iter()
-                .find_map(|(id, s)| if s.root == root { Some(id) } else { None });
-            if let Some(l) = layout {
-                self.remove_window_internal(l, wid);
+        // Every layout of this workspace, not only the one the index points at: the
+        // per-display-size layouts mirror each other, and a leaf left behind in an
+        // inactive one comes back as a phantom when that size is shown again.
+        let layouts: Vec<_> = self.layouts.keys().collect();
+        for layout in layouts {
+            self.remove_window_from_layout(layout, wid);
+        }
+        self.unindex_window(wid);
+    }
+
+    fn repair_memberships(&mut self) -> usize {
+        let mut removed = 0;
+        let layouts: Vec<_> = self.layouts.keys().collect();
+        for layout in layouts {
+            for (window, count) in self.window_occurrences(layout) {
+                // Removal takes the first leaf in preorder; the last one keeps the window.
+                for _ in 1..count {
+                    self.remove_window_internal(layout, window);
+                    removed += 1;
+                }
             }
         }
+        // The index points at a leaf that exists.
+        self.window_to_node
+            .retain(|_, node| matches!(self.kind.get(*node), Some(NodeKind::Leaf { .. })));
+        removed
     }
 
     fn remove_windows_for_app(&mut self, pid: pid_t) {

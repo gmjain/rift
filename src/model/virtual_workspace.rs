@@ -365,6 +365,15 @@ impl WorkspaceStore {
         layouts
     }
 
+    /// Drop leaves that repeat a window within a layout, in every workspace. Returns how
+    /// many were removed.
+    pub(crate) fn repair_layout_memberships(&mut self) -> usize {
+        self.workspaces
+            .values_mut()
+            .map(|workspace| workspace.layout_system.repair_memberships())
+            .sum()
+    }
+
     pub(crate) fn validate_layouts(&self) -> Result<(), String> {
         for (id, workspace) in &self.workspaces {
             workspace
