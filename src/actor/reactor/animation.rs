@@ -1043,6 +1043,9 @@ impl AnimationManager {
             }
 
             let target_frame = target_frame.round();
+            if owned_by_another_space(reactor, space, wid) {
+                continue;
+            }
             let Some(window) = reactor.state.windows.window(wid) else {
                 continue;
             };
@@ -1149,7 +1152,7 @@ impl AnimationManager {
 
     fn instant_layout_inner(
         reactor: &mut Reactor,
-        _space: SpaceId,
+        space: SpaceId,
         layout: &[(WindowId, CGRect)],
         skip_wid: Option<WindowId>,
         position_only: bool,
@@ -1161,6 +1164,9 @@ impl AnimationManager {
         for &(wid, target_frame) in layout {
             if skip_wid == Some(wid) {
                 trace!(?wid, "Skipping layout update for window currently being dragged");
+                continue;
+            }
+            if owned_by_another_space(reactor, space, wid) {
                 continue;
             }
 
@@ -1242,6 +1248,17 @@ impl AnimationManager {
 
         any_frame_changed
     }
+}
+
+/// Whether the store places `wid` in a workspace of another native space. Such a window is
+/// positioned by that space's layout alone; a frame for it from `space` (a layout node left
+/// behind by a move) would fight that layout for the window.
+fn owned_by_another_space(reactor: &Reactor, space: SpaceId, wid: WindowId) -> bool {
+    reactor
+        .state
+        .windows
+        .workspace_info_for_window(wid)
+        .is_some_and(|assignment| assignment.space != space)
 }
 
 impl Motion {
