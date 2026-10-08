@@ -10427,3 +10427,106 @@ fn a_layout_file_without_window_server_ids_or_boot_still_restores() {
     assert_eq!(restart.after.showing, restart.before.showing);
     assert_eq!(restart.after.owners, restart.before.owners);
 }
+
+/// The full frames rift asked `window`'s app to set, from the requests queued so far
+/// (direct requests and finished animations alike), in order; the requests are consumed.
+fn frames_requested(apps: &mut Apps, window: WindowId) -> Vec<CGRect> {
+    let requests = apps.requests();
+    frames_in(&requests, window)
+}
+
+fn frames_in(requests: &[Request], window: WindowId) -> Vec<CGRect> {
+    requests
+        .iter()
+        .filter_map(|request| match request {
+            Request::SetWindowFrames(frames, ..) => Some(frames),
+            _ => None,
+        })
+        .flat_map(|frames| frames.iter().filter(|(wid, _)| *wid == window).map(|(_, f)| *f))
+        .collect()
+}
+
+fn tiled_frame(reactor: &mut Reactor, space: SpaceId, screen: CGRect, window: WindowId) -> CGRect {
+    use crate::sys::geometry::Round;
+    test_layout(reactor, space, screen)
+        .into_iter()
+        .find(|(wid, _)| *wid == window)
+        .map(|(_, frame)| frame.round())
+        .unwrap_or_else(|| panic!("{window:?} is tiled on {space:?}"))
+}
+
+/// macOS answers a frame request with the frame it constrained the window to (a size set
+/// while the window still sat on the display it was leaving). Rift asks once more; a
+/// window that refuses again is left alone until the layout changes.
+#[test]
+fn a_frame_request_answered_with_another_frame_is_laid_out_again_once() {
+    let (mut apps, mut reactor) = test_context();
+    let (screen, space) = (left_screen(), SpaceId::new(1));
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    let window = WindowId::new(1, 1);
+    make_active_app(&mut apps, &mut reactor, 1, make_windows(2), Some(window));
+    let _ = apps.requests();
+    let wsid = reactor.test_window_server_id(window);
+    let layout_frame = tiled_frame(&mut reactor, space, screen, window);
+    let clamped = CGRect::new(
+        layout_frame.origin,
+        CGSize::new(layout_frame.size.width, layout_frame.size.height - 200.),
+    );
+
+    // Rift asked for the layout frame; the app reports the clamped one for that request.
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, layout_frame);
+    reactor.handle_event(Event::WindowFrameChanged(
+        window,
+        clamped,
+        Some(txid),
+        Requested(true),
+        Some(MouseState::Up),
+    ));
+    assert_eq!(
+        frames_requested(&mut apps, window),
+        vec![layout_frame],
+        "rift asks once more for the frame it laid out"
+    );
+    assert_eq!(
+        reactor.transaction_manager.get_target_frame(wsid),
+        Some(layout_frame)
+    );
+
+    // Refused again: no third request, the target stays recorded.
+    let txid = reactor.transaction_manager.get_last_sent_txid(wsid);
+    reactor.handle_event(Event::WindowFrameChanged(
+        window,
+        clamped,
+        Some(txid),
+        Requested(true),
+        Some(MouseState::Up),
+    ));
+    assert!(frames_requested(&mut apps, window).is_empty());
+    assert_eq!(
+        reactor.transaction_manager.get_target_frame(wsid),
+        Some(layout_frame)
+    );
+
+    // Accepted on a later request: the next refusal is retried again.
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, layout_frame);
+    reactor.handle_event(Event::WindowFrameChanged(
+        window,
+        layout_frame,
+        Some(txid),
+        Requested(true),
+        Some(MouseState::Up),
+    ));
+    assert_eq!(reactor.transaction_manager.get_target_frame(wsid), None);
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, layout_frame);
+    reactor.handle_event(Event::WindowFrameChanged(
+        window,
+        clamped,
+        Some(txid),
+        Requested(true),
+        Some(MouseState::Up),
+    ));
+    assert_eq!(frames_requested(&mut apps, window), vec![layout_frame]);
+}

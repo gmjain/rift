@@ -463,6 +463,13 @@ pub struct Reactor {
     /// Cross-display moves rift started that macOS may not have caught up with:
     /// window -> (target space, end of the grace period).
     in_flight_display_moves: HashMap<WindowServerId, (SpaceId, Instant)>,
+    /// Windows whose last frame request the app acknowledged with another frame, with
+    /// the number of times rift asked again (see `repair_rejected_frame`).
+    frame_repairs: HashMap<WindowServerId, u8>,
+    /// The last frame request of each window that went to the animation presenter. Reports
+    /// for it (an animation's end or cancel, or a frame observed on the way) are not the
+    /// app's answer to one write; the app thread re-writes a clamped end frame itself.
+    animated_requests: HashMap<WindowServerId, TransactionId>,
     /// Workspace display bindings need re-applying once the current event's
     /// outcome has settled window membership.
     bindings_need_check: bool,
@@ -619,6 +626,8 @@ impl Reactor {
             viewport_gesture: None,
             presentations: HashMap::default(),
             in_flight_display_moves: HashMap::default(),
+            frame_repairs: HashMap::default(),
+            animated_requests: HashMap::default(),
             bindings_need_check: false,
             autosave: autosave::Autosave::new(&config.settings.persistence, autosave_path()),
             borders: borders::BorderPublisher::default(),
@@ -1743,6 +1752,19 @@ impl Reactor {
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
                 let mission_control_active = self.is_mission_control_active();
                 let mut effective_mouse_state = mouse_state;
+                // The app's answer to rift's own, current frame request: the classifier
+                // below swallows it, so note what was asked before it runs.
+                let acknowledged_request =
+                    self.state.windows.window(wid).and_then(|window| window.info.sys_id).and_then(
+                        |wsid| {
+                            let target = self.transaction_manager.get_target_frame(wsid)?;
+                            let last_sent = self.transaction_manager.get_last_sent_txid(wsid);
+                            let current = last_seen == Some(last_sent);
+                            let animated = self.animated_requests.get(&wsid) == Some(&last_sent);
+                            (requested.0 && current && !animated && !mission_control_active)
+                                .then_some((wsid, target))
+                        },
+                    );
                 if matches!(
                     window_workflow::classify_window_frame_change(
                         &mut self.state,
@@ -1762,6 +1784,12 @@ impl Reactor {
                         == Some(crate::sys::event::MouseState::Up)
                         && self.drag_manager.actor.is_active();
                     outcome.focused_window = raised_window;
+                    if let Some((wsid, target)) = acknowledged_request
+                        && effective_mouse_state != Some(MouseState::Down)
+                        && !self.is_in_drag()
+                    {
+                        outcome.absorb(self.repair_rejected_frame(wid, wsid, target, new_frame));
+                    }
                     return Ok(outcome);
                 }
                 let (server_id, old_frame) = self
@@ -3815,6 +3843,62 @@ impl Reactor {
 
     fn assigned_space_for_window_id(&self, wid: WindowId) -> Option<SpaceId> {
         self.state.windows.workspace_info_for_window(wid).map(|info| info.space)
+    }
+
+    /// Lay a tiled window out again, once, when the app answered rift's frame request with
+    /// a different frame.
+    ///
+    /// macOS constrains a frame against the display the window is on when it is set: a
+    /// size written while the window still sits on the display it is leaving comes back
+    /// clamped to that display. The request is answered, so its target is dropped (left in
+    /// place it hides the mismatch from every later layout pass, which sees its own frame
+    /// pending and skips the window) and the window's display lays it out again, which now
+    /// lands. An app that refuses the frame again is left alone until the layout changes.
+    /// Only for a single write (instant layout, direct positioning): an animated request is
+    /// reported mid-way too, and its end frame is re-written by the app thread.
+    fn repair_rejected_frame(
+        &mut self,
+        window: WindowId,
+        wsid: WindowServerId,
+        target: CGRect,
+        actual: CGRect,
+    ) -> EventOutcome {
+        use crate::sys::geometry::IsWithin;
+        /// Below this, AppKit's own rounding of a frame it accepted.
+        const TOLERANCE: f64 = 2.0;
+        if actual.is_within(TOLERANCE, target) {
+            self.frame_repairs.remove(&wsid);
+            return EventOutcome::no_change();
+        }
+        let Some(space) = self.assigned_space_for_window_id(window) else {
+            return EventOutcome::no_change();
+        };
+        let engine = &self.layout_manager.layout_engine;
+        // Parked windows of hidden workspaces are placed past the display edge on purpose
+        // and adjusted by macOS; only a window the user sees is worth asking again for.
+        if !self.is_space_active(space)
+            || engine.is_window_floating(window)
+            || !engine.workspaces().is_window_in_active_workspace(
+                &self.state.windows,
+                space,
+                window,
+            )
+        {
+            return EventOutcome::no_change();
+        }
+        let attempts = self.frame_repairs.entry(wsid).or_insert(0);
+        if *attempts >= 1 {
+            return EventOutcome::no_change();
+        }
+        *attempts += 1;
+        debug!(
+            ?window,
+            ?target,
+            ?actual,
+            "frame request answered with another frame; laying the window out again"
+        );
+        self.transaction_manager.clear_target_for_window(wsid);
+        EventOutcome::layout_changed(false).with_arrange_space_scope(Some(space))
     }
 
     /// Record that rift just moved `window` onto `target`'s display.

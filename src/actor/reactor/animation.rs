@@ -1081,6 +1081,9 @@ impl AnimationManager {
             if is_active {
                 trace!(?wid, ?current_frame, ?target_frame, "Animating visible window");
                 anim.add_window(&app_state.handle, wid, current_frame, target_frame, txid);
+                if let Some(wsid) = window_server_id {
+                    reactor.animated_requests.insert(wsid, txid);
+                }
             } else {
                 anim.mark_handled(wid);
                 trace!(
