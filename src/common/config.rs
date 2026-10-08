@@ -601,6 +601,25 @@ pub struct Settings {
     /// doubles up to 60 s. 0 disables the fallback.
     #[serde(default = "default_event_tap_timeout_limit")]
     pub event_tap_timeout_limit: u32,
+    /// Where rift's HID event tap goes among the other HID taps, for the
+    /// first tap and every rebuild. A change rebuilds the tap.
+    #[serde(default)]
+    pub event_tap_placement: EventTapPlacement,
+}
+
+/// Position of rift's HID event tap in WindowServer's HID tap chain.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EventTapPlacement {
+    /// Before every other HID tap (`kCGHeadInsertEventTap`, upstream behaviour):
+    /// rift consumes its hotkeys before tools like Synergy see them.
+    #[default]
+    Head,
+    /// After the HID taps that exist when rift creates its tap
+    /// (`kCGTailAppendEventTap`): they see input first, and what they consume
+    /// never reaches rift. A tap another app inserts at the head later still
+    /// runs before rift.
+    Tail,
 }
 
 /// The layout file (`restore_file()`) outside of explicit saves.
@@ -2758,6 +2777,28 @@ mod tests {
         assert!(settings.floating_windows_on_top);
         let settings: Settings = toml::from_str("").unwrap();
         assert!(!settings.floating_windows_on_top);
+    }
+
+    #[test]
+    fn event_tap_placement_defaults_to_head_and_parses_tail() {
+        assert_eq!(
+            Config::default().settings.event_tap_placement,
+            EventTapPlacement::Head
+        );
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.event_tap_placement, EventTapPlacement::Head);
+        let settings: Settings = toml::from_str(r#"event_tap_placement = "tail""#).unwrap();
+        assert_eq!(settings.event_tap_placement, EventTapPlacement::Tail);
+        let settings: Settings = toml::from_str(r#"event_tap_placement = "head""#).unwrap();
+        assert_eq!(settings.event_tap_placement, EventTapPlacement::Head);
+        for bad in [r#""Tail""#, r#""middle""#, "1", "true"] {
+            assert!(
+                toml::from_str::<Settings>(&format!("event_tap_placement = {bad}")).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        let cfg = Config::parse("[settings]\nevent_tap_placement = \"tail\"\n[keys]\n").unwrap();
+        assert_eq!(cfg.settings.event_tap_placement, EventTapPlacement::Tail);
     }
 
     #[test]

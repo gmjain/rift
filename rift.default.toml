@@ -95,6 +95,18 @@ hot_reload = true
 # - 0 turns the breaker off (always re-enable at once).
 event_tap_timeout_limit = 3
 
+# Event tap placement: where rift's input tap goes among the other HID event taps.
+# - "head" (default): rift runs first and consumes its hotkeys before any other tap sees them.
+#   A tool whose own tap must see them first (Synergy forwarding keys to another machine,
+#   mouse utilities) then loses them.
+# - "tail": rift runs after the taps that already exist (and after any tap another app later
+#   inserts at the head), so what they consume never reaches rift: keys Synergy forwards
+#   while its cursor is on the other machine no longer trigger rift. Their remaps reach
+#   rift remapped. Apps and session-level taps (Hammerspoon, Carbon hotkeys) still run
+#   after rift either way.
+# - Applies to the first tap and every rebuild; changing it rebuilds the tap.
+event_tap_placement = "head"
+
 # Layout file (~/.rift/layout.ron): workspaces, layout trees and floating windows.
 # `save-and-exit` and `save-layout` write it; `rift --restore` reads it at startup.
 # - autosave: also save it shortly after every layout change, so a restart or a crash
