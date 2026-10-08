@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use tracing::warn;
 
 use super::run_loop::WakeupHandle;
+use crate::common::config::EventTapPlacement;
 
 /// A thread whose run loop services event taps and nothing else.
 ///
@@ -82,6 +83,15 @@ fn set_user_interactive_qos() {
     }
     if unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) } != 0 {
         warn!("Could not raise the event tap thread to user-interactive QoS");
+    }
+}
+
+impl From<EventTapPlacement> for CGTapPlace {
+    fn from(placement: EventTapPlacement) -> Self {
+        match placement {
+            EventTapPlacement::Head => CGTapPlace::HeadInsertEventTap,
+            EventTapPlacement::Tail => CGTapPlace::TailAppendEventTap,
+        }
     }
 }
 
@@ -300,6 +310,7 @@ unsafe fn trampoline_drop(ptr: *mut c_void) {
 
 pub struct EventTap {
     port: CFRetained<CFMachPort>,
+    placement: CGTapPlace,
     source: CFRetained<CFRunLoopSource>,
     run_loop: Option<CFRetained<CFRunLoop>>,
     thread: Option<Arc<TapThread>>,
@@ -309,12 +320,14 @@ pub struct EventTap {
 
 impl EventTap {
     /// Creates a tap serviced by `thread`, or by the current run loop when
-    /// `thread` is `None` (Rift input uses active HID).
+    /// `thread` is `None` (Rift input uses active HID). `placement` orders it
+    /// among the taps already at `location`.
     /// On failure the caller retains ownership of `user_info`.
     pub unsafe fn new(
         location: CGTapLoc,
         options: CGTapOpt,
         mask: CGEventMask,
+        placement: CGTapPlace,
         callback: TapCallback,
         user_info: *mut c_void,
         drop_ctx: Option<unsafe fn(*mut c_void)>,
@@ -342,7 +355,7 @@ impl EventTap {
         let port = unsafe {
             CGEvent::tap_create(
                 location,
-                CGTapPlace::HeadInsertEventTap,
+                placement,
                 options,
                 mask,
                 Some(trampoline_callback),
@@ -383,6 +396,7 @@ impl EventTap {
 
         Some(Self {
             port,
+            placement,
             source,
             run_loop,
             thread: thread.cloned(),
@@ -393,6 +407,9 @@ impl EventTap {
 
     /// Synchronous WindowServer query; never call it from the tap callback.
     pub fn is_enabled(&self) -> bool { CGEvent::tap_is_enabled(&self.port) }
+
+    /// The placement this tap was created with.
+    pub fn placement(&self) -> CGTapPlace { self.placement }
 }
 
 impl Drop for EventTap {
@@ -445,6 +462,18 @@ mod tests {
         unsafe { &*(user_info as *const Calls) }
             .reconciles
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn placement_setting_maps_to_core_graphics_placement() {
+        assert_eq!(
+            CGTapPlace::from(EventTapPlacement::Head),
+            CGTapPlace::HeadInsertEventTap
+        );
+        assert_eq!(
+            CGTapPlace::from(EventTapPlacement::Tail),
+            CGTapPlace::TailAppendEventTap
+        );
     }
 
     #[test]

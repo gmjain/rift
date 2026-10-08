@@ -17,7 +17,7 @@ use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
     CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventSource,
     CGEventSourceStateID, CGEventTapLocation as CGTapLoc, CGEventTapOptions as CGTapOpt,
-    CGEventTapProxy, CGEventType,
+    CGEventTapPlacement as CGTapPlace, CGEventTapProxy, CGEventType,
 };
 use parking_lot::Mutex;
 use tracing::{debug, error, trace, warn};
@@ -29,11 +29,11 @@ use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{
-    BindingModeSpecs, Config, DragDropSettings, HorizontalMouseWarp, LayoutMode, MouseAction,
-    MouseModifier, StackLineHoverMode,
+    BindingModeSpecs, Config, DragDropSettings, EventTapPlacement, HorizontalMouseWarp, LayoutMode,
+    MouseAction, MouseModifier, StackLineHoverMode,
 };
 use crate::sys::event::{self, Hotkey, KeyCode};
-use crate::sys::event_tap::{EventTap, TapThread};
+use crate::sys::event_tap::TapThread;
 use crate::sys::hotkey::{
     Modifiers, is_modifier_key, key_code_from_event, modifier_key_is_active,
     modifiers_from_flags_with_keys,
@@ -53,6 +53,13 @@ const FORWARD_CAPACITY: usize = 64;
 
 /// Events the callback passed through because the state lock was busy.
 static CALLBACK_LOCK_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// The installed HID tap. Unit tests get a recorder with the same interface,
+/// so no test inserts a real tap into the live session's HID event chain.
+#[cfg(not(test))]
+type Tap = crate::sys::event_tap::EventTap;
+#[cfg(test)]
+type Tap = tests::RecordedTap;
 
 #[derive(Debug)]
 pub enum Request {
@@ -95,9 +102,11 @@ pub struct Input {
     hide_count: Cell<u32>,
     mouse_hides_on_focus: Cell<bool>,
     gesture_control: super::gesture::Control,
-    tap: RefCell<Option<EventTap>>,
+    tap: RefCell<Option<Tap>>,
     tap_thread: RefCell<Option<Arc<TapThread>>>,
     tap_generation: Cell<u64>,
+    /// `settings.event_tap_placement`, for the next tap created.
+    tap_placement: Cell<EventTapPlacement>,
     binding_mode_specs: RefCell<BindingModeSpecs>,
     hotkeys_active: Cell<bool>,
 }
@@ -247,7 +256,7 @@ impl Input {
         mask
     }
 
-    fn create_tap_with_mask(&self, mask: CGEventMask) -> Option<EventTap> {
+    fn create_tap_with_mask(&self, mask: CGEventMask) -> Option<Tap> {
         let tap_generation = self.tap_generation.get().wrapping_add(1);
         self.callback_ctx.tap_generation.store(tap_generation, Ordering::Release);
         let ctx_ptr = &**self.callback_ctx as *const CallbackCtx as *mut std::ffi::c_void;
@@ -261,11 +270,13 @@ impl Input {
                 );
             }
         }
+        let placement = CGTapPlace::from(self.tap_placement.get());
         let tap = unsafe {
-            EventTap::new(
+            Tap::new(
                 CGTapLoc::HIDEventTap,
                 CGTapOpt::Default,
                 mask,
+                placement,
                 Some(input_callback),
                 ctx_ptr,
                 None,
@@ -277,13 +288,18 @@ impl Input {
 
         if tap.is_some() {
             self.tap_generation.set(tap_generation);
+            debug!(tap_generation, mask, ?placement, "Created the HID event tap");
         }
         tap
     }
 
+    /// The only way rift creates its tap: the first one, mask changes,
+    /// placement changes and recovery all come through here.
     fn rebuild_event_tap_mask_if_needed(&self) {
         let next_mask = self.desired_event_mask(&self.state.lock());
-        if next_mask == self.event_mask.get() && (next_mask == 0 || self.tap.borrow().is_some()) {
+        let placement = CGTapPlace::from(self.tap_placement.get());
+        let installed = self.tap.borrow().as_ref().map(|tap| tap.placement());
+        if next_mask == self.event_mask.get() && (next_mask == 0 || installed == Some(placement)) {
             return;
         }
 
@@ -420,6 +436,7 @@ impl Input {
             tap: RefCell::new(None),
             tap_thread: RefCell::new(None),
             tap_generation: Cell::new(0),
+            tap_placement: Cell::new(config.settings.event_tap_placement),
             binding_mode_specs: RefCell::new(config.binding_mode_specs),
             hotkeys_active: Cell::new(false),
         }
@@ -625,6 +642,8 @@ impl Input {
                 crate::sys::event_tap::set_timeout_limit(
                     new_config.settings.event_tap_timeout_limit,
                 );
+                // The rebuild below re-creates the tap when the placement changed.
+                self.tap_placement.set(new_config.settings.event_tap_placement);
                 let cancel_captured_drag = state.captured_button.is_some()
                     && (!new_config.settings.drag_drop.enabled
                         || new_config.settings.drag_drop != state.mouse_settings);
@@ -1999,12 +2018,7 @@ mod tests {
         crate::sys::executor::Executor::run(input.run());
     }
 
-    fn input() -> (Input, actor::Receiver<WmEvent>, actor::Receiver<Event>) {
-        let (events_tx, events_rx) = actor::channel();
-        let (_, requests_rx) = actor::channel();
-        let (wm_tx, wm_rx) = actor::channel();
-        let (stack_tx, _) = actor::channel();
-        let (mc_tx, _) = actor::channel();
+    fn test_config() -> Config {
         let mut config = Config::default();
         config.settings.gestures.enabled = false;
         config.settings.layout.scrolling.gestures.enabled = false;
@@ -2012,6 +2026,19 @@ mod tests {
         config.settings.focus_follows_mouse_disable_hotkey = None;
         config.settings.mouse_hides_on_focus = false;
         config.settings.ui.stack_line.enabled = false;
+        config
+    }
+
+    fn input() -> (Input, actor::Receiver<WmEvent>, actor::Receiver<Event>) {
+        input_with(test_config())
+    }
+
+    fn input_with(config: Config) -> (Input, actor::Receiver<WmEvent>, actor::Receiver<Event>) {
+        let (events_tx, events_rx) = actor::channel();
+        let (_, requests_rx) = actor::channel();
+        let (wm_tx, wm_rx) = actor::channel();
+        let (stack_tx, _) = actor::channel();
+        let (mc_tx, _) = actor::channel();
         (
             Input::new(
                 config,
@@ -2026,6 +2053,141 @@ mod tests {
             wm_rx,
             events_rx,
         )
+    }
+
+    /// Stands in for `EventTap` in unit tests: keeps what the actor asked for
+    /// instead of inserting a real tap into the live HID event chain.
+    pub(super) struct RecordedTap {
+        mask: CGEventMask,
+        placement: CGTapPlace,
+        enabled: Cell<bool>,
+    }
+
+    impl RecordedTap {
+        /// Same signature as `EventTap::new`, so the actor's call is unchanged.
+        pub(super) unsafe fn new(
+            location: CGTapLoc,
+            options: CGTapOpt,
+            mask: CGEventMask,
+            placement: CGTapPlace,
+            _callback: crate::sys::event_tap::TapCallback,
+            _user_info: *mut std::ffi::c_void,
+            _drop_ctx: Option<unsafe fn(*mut std::ffi::c_void)>,
+            _reenabled: crate::sys::event_tap::TapReenabledCallback,
+            _invalidated: crate::sys::event_tap::TapInvalidatedCallback,
+            _thread: Option<&Arc<TapThread>>,
+        ) -> Option<Self> {
+            assert_eq!(location, CGTapLoc::HIDEventTap);
+            assert_eq!(options, CGTapOpt::Default);
+            Some(Self {
+                mask,
+                placement,
+                enabled: Cell::new(true),
+            })
+        }
+
+        pub(super) fn is_enabled(&self) -> bool { self.enabled.get() }
+
+        pub(super) fn placement(&self) -> CGTapPlace { self.placement }
+    }
+
+    /// (generation, mask, placement) of the installed tap.
+    fn installed_tap(input: &Input) -> Option<(u64, CGEventMask, CGTapPlace)> {
+        let tap = input.tap.borrow();
+        tap.as_ref().map(|tap| (input.tap_generation.get(), tap.mask, tap.placement))
+    }
+
+    const RELEASES: CGEventMask =
+        (1u64 << CGEventType::LeftMouseUp.0) | (1u64 << CGEventType::RightMouseUp.0);
+
+    #[test]
+    fn first_tap_and_every_rebuild_use_the_configured_placement() {
+        let mut config = test_config();
+        config.settings.event_tap_placement = EventTapPlacement::Tail;
+        config.settings.drag_drop.enabled = false;
+        let (input, _, _) = input_with(config);
+        input.rebuild_event_tap_mask_if_needed();
+        assert_eq!(installed_tap(&input), None, "no tap while nothing is masked");
+
+        // First tap: what `run()` does on start once event processing is on.
+        input.state.lock().event_processing_enabled = true;
+        input.rebuild_event_tap_mask_if_needed();
+        let tail = CGTapPlace::TailAppendEventTap;
+        assert_eq!(installed_tap(&input), Some((1, RELEASES, tail)));
+
+        // Nothing changed: the tap stays.
+        input.rebuild_event_tap_mask_if_needed();
+        assert_eq!(installed_tap(&input).unwrap().0, 1);
+
+        // Mask change (focus-follows-mouse adds mouse moves).
+        input.state.lock().focus_follows_mouse_config_enabled = true;
+        input.rebuild_event_tap_mask_if_needed();
+        let moves = RELEASES | (1u64 << CGEventType::MouseMoved.0);
+        assert_eq!(installed_tap(&input), Some((2, moves, tail)));
+
+        // Mask change on the request path (Mission Control rebuilds the tap).
+        input.on_request(Request::SetMissionControlActive(true));
+        let (generation, mask, placement) = installed_tap(&input).unwrap();
+        assert_eq!((generation, placement), (3, tail));
+        assert_ne!(mask & (1u64 << CGEventType::ScrollWheel.0), 0);
+        input.on_request(Request::SetMissionControlActive(false));
+        assert_eq!(installed_tap(&input), Some((4, moves, tail)));
+
+        // Mach port invalidated: recreated at the same place.
+        input.rebuild_invalidated_event_tap(4);
+        assert_eq!(installed_tap(&input), Some((5, moves, tail)));
+
+        // WindowServer disabled it and the re-enable did not take: recreated.
+        input.tap.borrow().as_ref().unwrap().enabled.set(false);
+        input.on_tap_disabled(5);
+        assert_eq!(installed_tap(&input), Some((6, moves, tail)));
+
+        // Lost tap: the actor loop's retry path.
+        input.tap.borrow_mut().take();
+        input.rebuild_event_tap_mask_if_needed();
+        assert_eq!(installed_tap(&input), Some((7, moves, tail)));
+    }
+
+    #[test]
+    fn placement_change_on_reload_rebuilds_the_tap_with_the_same_mask() {
+        let mut config = test_config();
+        config.settings.drag_drop.enabled = false;
+        let (input, _, _) = input_with(config.clone());
+        input.state.lock().event_processing_enabled = true;
+        input.rebuild_event_tap_mask_if_needed();
+        let head = CGTapPlace::HeadInsertEventTap;
+        let tail = CGTapPlace::TailAppendEventTap;
+        assert_eq!(installed_tap(&input), Some((1, RELEASES, head)));
+
+        // A reload that changes nothing keeps the tap.
+        input.on_request(Request::ConfigUpdated(config.clone()));
+        assert_eq!(installed_tap(&input), Some((1, RELEASES, head)));
+
+        config.settings.event_tap_placement = EventTapPlacement::Tail;
+        input.on_request(Request::ConfigUpdated(config.clone()));
+        assert_eq!(installed_tap(&input), Some((2, RELEASES, tail)));
+        input.on_request(Request::ConfigUpdated(config.clone()));
+        assert_eq!(installed_tap(&input), Some((2, RELEASES, tail)));
+
+        config.settings.event_tap_placement = EventTapPlacement::Head;
+        input.on_request(Request::ConfigUpdated(config));
+        assert_eq!(installed_tap(&input), Some((3, RELEASES, head)));
+    }
+
+    #[test]
+    fn placement_change_while_nothing_is_masked_creates_no_tap() {
+        let mut config = test_config();
+        config.settings.drag_drop.enabled = false;
+        let (input, _, _) = input_with(config.clone());
+        config.settings.event_tap_placement = EventTapPlacement::Tail;
+        input.on_request(Request::ConfigUpdated(config));
+        assert_eq!(installed_tap(&input), None);
+        input.state.lock().event_processing_enabled = true;
+        input.rebuild_event_tap_mask_if_needed();
+        assert_eq!(
+            installed_tap(&input),
+            Some((1, RELEASES, CGTapPlace::TailAppendEventTap))
+        );
     }
 
     #[test]
