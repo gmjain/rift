@@ -1382,6 +1382,18 @@ impl LayoutEngine {
             self.floating.add_active(space, wid.pid, wid);
         } else if let Some(layout) = self.workspaces.active_layout(space, assigned_workspace) {
             if !self.workspaces[assigned_workspace].layout_system.contains_window(layout, wid) {
+                // A window tiles in one workspace. Added here after the store moved it from
+                // another workspace (a snapshot that found it on another display), it leaves
+                // that workspace's layouts; otherwise both layouts keep placing it.
+                let other_workspaces: Vec<_> = self
+                    .workspaces
+                    .workspaces
+                    .keys()
+                    .filter(|id| *id != assigned_workspace)
+                    .collect();
+                for workspace_id in other_workspaces {
+                    self.workspaces[workspace_id].layout_system.remove_window(wid);
+                }
                 if matches!(
                     self.workspaces[assigned_workspace].layout_system,
                     LayoutSystemKind::Scrolling(_)
@@ -6035,5 +6047,83 @@ mod tests {
             assert_eq!(frames[&WindowId::new(1, 1)], top, "{mode:?}");
             assert_eq!(frames[&WindowId::new(1, 2)], bottom, "{mode:?}");
         }
+    }
+
+    fn tiled_windows(engine: &mut LayoutEngine, space: SpaceId, screen: CGRect) -> Vec<WindowId> {
+        let gaps = engine.layout_settings.gaps.clone();
+        let mut windows: Vec<_> = engine
+            .calculate_layout(space, screen, &gaps, 0.0, Default::default(), Default::default())
+            .into_iter()
+            .map(|(wid, _)| wid)
+            .collect();
+        windows.sort_unstable();
+        windows
+    }
+
+    /// A workspace keeps one layout per display size. A window removed while another
+    /// size was showing must be gone from the saved layout of the first size too, or it
+    /// comes back there as a phantom, placed by this display while another owns it.
+    #[test]
+    fn a_window_removed_at_another_display_size_is_gone_when_the_first_size_returns() {
+        let mut window_store = WindowStore::default();
+        let mut engine = test_engine();
+        let space = SpaceId::new(97);
+        let laptop = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 600.0));
+        let external = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 1600.0));
+        let pid: pid_t = 7;
+        let (first, second) = (WindowId::new(pid, 1), WindowId::new(pid, 2));
+
+        let _ =
+            engine.handle_event(&mut window_store, LayoutEvent::SpaceExposed(space, laptop.size));
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowAdded(space, first));
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowAdded(space, second));
+        assert_eq!(tiled_windows(&mut engine, space, laptop), vec![first, second]);
+
+        // The display changes size: the workspace gets a second layout, a copy of the first.
+        let _ = engine.handle_event(
+            &mut window_store,
+            LayoutEvent::SpaceExposed(space, external.size),
+        );
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowRemoved(first));
+        assert_eq!(tiled_windows(&mut engine, space, external), vec![second]);
+
+        // Back at the first size, its saved layout is shown again.
+        let _ =
+            engine.handle_event(&mut window_store, LayoutEvent::SpaceExposed(space, laptop.size));
+        assert_eq!(
+            tiled_windows(&mut engine, space, laptop),
+            vec![second],
+            "the window removed meanwhile is not back"
+        );
+    }
+
+    /// A window tiles on one display. Added on another one (a snapshot found it there), it
+    /// leaves the first display's layout; otherwise both displays keep placing it.
+    #[test]
+    fn a_window_added_on_another_space_leaves_the_layout_of_the_first() {
+        let mut window_store = WindowStore::default();
+        let mut engine = test_engine();
+        let (left, right) = (SpaceId::new(98), SpaceId::new(99));
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 1000.0));
+        let window = WindowId::new(7, 1);
+
+        for space in [left, right] {
+            let _ = engine
+                .handle_event(&mut window_store, LayoutEvent::SpaceExposed(space, screen.size));
+        }
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowAdded(left, window));
+        assert_eq!(tiled_windows(&mut engine, left, screen), vec![window]);
+
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowAdded(right, window));
+
+        assert_eq!(tiled_windows(&mut engine, right, screen), vec![window]);
+        assert!(
+            tiled_windows(&mut engine, left, screen).is_empty(),
+            "the display the window left has no frame for it"
+        );
+        assert_eq!(
+            window_store.workspace_info_for_window(window).map(|a| a.space),
+            Some(right)
+        );
     }
 }
