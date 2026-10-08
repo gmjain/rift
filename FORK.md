@@ -13,27 +13,35 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
 - Upstream sync: rebase `main` onto new `upstream/main`, drop commits upstream has absorbed.
 
 ## Patch list
+Base: upstream 0.6.9 (`659eaa5`), rebased 2026-10-08; the 0.6.8-based queue is tag
+`archive/main-pre-0.6.9-2026-10-08` (`1fe6c87`).
+
 | # | Patch | Commits on `main` | Status |
 |---|---|---|---|
-| 1 | fix: raise storm (snapshot refocus) | `bcdf99b` | done; live since 2026-10-06 (old base, `d4d8b1b`) |
-| 2 | fix: only refocus on the display that has focus | `88e097a` | done; live (old base) |
-| 3 | fix: bound actor span chain (stack overflow) | `aed2ac2` | done; live (old base) |
-| 4 | fix: reply to `save-and-exit` before exiting | `aac49fb` | done; live (old base) |
-| 5 | PR #545: display-bound workspaces, multi-display fixes | `ddbba62` to `0cba564` (11) | done |
-| 6 | i3-style global workspaces (`[virtual_workspaces] scope = "global"`) | `08c84dc` to `7cb53d5` (12) | done, off by default |
-| 7 | aspect split (`auto_split_by_aspect`, `root_orientation`) | `09846e2`, `0d5abcf` | done, off by default |
-| 8 | test isolation: unit tests never call into the live WindowServer | `fda497c` to `4436091` (5) | done (test-only) |
-| 9 | layout persistence: `[settings.persistence]` autosave, `restore_on_start`, same-boot id matching | `c2db77f` to `75a2ce7` (5) | done, off by default |
-| 10 | menu bar: dashed frame around a workspace with a fullscreen window | `e8b0b43`, `adbe92a` | done |
-| 11 | native window borders + dimming (`[settings.ui.border]`, `[settings.ui.dim]`) | `b17bd6e` to `7171c2c` (6) | done, off by default |
-| 12 | floating windows above tiled ones (`[settings] floating_windows_on_top`) | `ca789bf`, `d63800c` | done, off by default |
-| 13 | input-freeze fix: event tap on its own thread, non-blocking timeout handler, tap breaker (`[settings] event_tap_timeout_limit`) | `b03e557`, `3bb738a` | done |
-| 14 | `workspace_changed` at once when a switch only focuses another display; no repeat for a snapshot that re-confirms it | `89f3655`, `c18debe` | done |
-| 15 | built-in workspace HUD (`[settings.ui.workspace_hud]`), drawn at the switch decision | `295e558`, `fd3ab1d` | done, off by default |
+| 1 | raise storm (snapshot refocus): regression tests; the fix is upstream #567 since 0.6.9 | `dd700b9` | slimmed to tests at the 0.6.9 rebase |
+| 2 | fix: only refocus on the display that has focus | `ecc0b73` | done; live (0.6.8 build) |
+| 3 | fix: bound actor span chain (stack overflow) | `990be3e` | done; live (0.6.8 build) |
+| 4 | fix: reply to `save-and-exit` before exiting | `3e14523` | done; live (0.6.8 build) |
+| 5 | PR #545: display-bound workspaces, multi-display fixes | `889603c` to `8c123ab` (11) | done |
+| 6 | i3-style global workspaces (`[virtual_workspaces] scope = "global"`) | `1cfa7ce` to `fcec484` (12) | done, off by default |
+| 7 | aspect split (`auto_split_by_aspect`, `root_orientation`) | `e208c9c`, `833a4f3` | done, off by default |
+| 8 | test isolation: unit tests never call into the live WindowServer | `e42f42c` to `f099236` (5) | done (test-only) |
+| 9 | layout persistence: `[settings.persistence]` autosave, `restore_on_start`, same-boot id matching | `8995938` to `d909fb3` (5) | done, off by default |
+| 10 | menu bar: dashed frame around a workspace with a fullscreen window | `c2a89c8`, `e079b76` | done |
+| 11 | native window borders + dimming (`[settings.ui.border]`, `[settings.ui.dim]`) | `6858889` to `0e4bf46` (6) | done, off by default |
+| 12 | floating windows above tiled ones (`[settings] floating_windows_on_top`) | `1b06514`, `282a5ce` | done, off by default |
+| 13 | input-freeze fix: event tap on its own thread, non-blocking timeout handler, tap breaker (`[settings] event_tap_timeout_limit`) | `80d8433`, `841fd70` | done |
+| 14 | `workspace_changed` at once when a switch only focuses another display; no repeat for a snapshot that re-confirms it | `4793b63`, `ce59646` | done |
+| 15 | built-in workspace HUD (`[settings.ui.workspace_hud]`), drawn at the switch decision | `043add6`, `a9ef97a` | done, off by default |
+| 16 | a window in one bsp leaf on one display: duplicate-leaf fix for cross-display moves | `f6a1683` to `c90c308` (6) | done |
 
 - Rows 1-4 are the former local branch `wms/fixes` (base 3a99afa, v0.6.7), rebased onto
-  upstream 0.6.8. Root-cause write-ups: `wms/docs/incidents/2026-10-05-rift-*.md`.
-- Row 5 is upstream PR #545 (@sj-cstar, open), picked with authorship kept; `9ff9f43` was
+  upstream 0.6.8, then 0.6.9. Root-cause write-ups: `wms/docs/incidents/2026-10-05-rift-*.md`.
+  Row 1 was the fix (skip the refocus for a `WindowAdded` that re-confirms a parked window);
+  upstream #567 (0.6.9) fixes the storm with a narrower rule (only a hidden window that holds
+  focus asks for a replacement), which the fork's guard contradicted, so the guard was dropped
+  and the two-display harness and its tests stay as regression cover for #567.
+- Row 5 is upstream PR #545 (@sj-cstar, open), picked with authorship kept; `a2959e8` was
   reconciled with upstream #566 (both ordinal-keeping rules apply).
 - Rows 6-7 change nothing until configured: `scope` defaults to `"per_display"`, the aspect keys
   to off. Design and review: `wms/docs/rift-global-workspaces.md`,
@@ -67,6 +75,15 @@ Workflow lives outside this repo: `wms/docs/rift-fork.md` (the `wms` workspace r
   overlay per display. Style presets card/pill/minimal/toast, 9 anchors, display choice.
   Off by default; the config block needs the new binary (`deny_unknown_fields`). Review of
   rows 14-15: `wms/docs/rift-fork-review-2026-10-06.md` (fourth pass).
+- Row 16 fixes `wms/docs/incidents/2026-10-07-rift-duplicate-leaf.md`: bsp keeps one layout per
+  display size and removed/renamed a window only in the indexed one, so a window moved to
+  another display left a phantom leaf that came back (two leaves, two displays placing it). Now
+  remove/replace walk every layout, insert is idempotent, a layout file is repaired on load,
+  `WindowAdded` on another space moves the window, a layout pass never positions a window
+  owned by another display, running presentations are fenced before global-scope moves, and a
+  single (not animated) frame write the app answers with another frame is laid out once more.
+  Upstream-worthy (issue draft in the incident doc). Review:
+  `wms/docs/rift-fork-review-2026-10-06.md` (fifth pass).
 - Status values: planned, in progress, done (on `main`), live (deployed), upstreamed, dropped.
 - Update this table in the same commit that changes a patch's status.
 
