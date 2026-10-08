@@ -549,6 +549,9 @@ impl Reactor {
             return Ok(EventOutcome::no_change());
         };
         let (window_server_id, frame) = (state.info.sys_id, state.frame_monotonic);
+        // As for `MoveWindowToDisplay`: a presentation still running on the source
+        // display must not land its frames after the destination frame.
+        self.cancel_window_presentations(vec![window]);
         let target_workspace = self
             .layout_manager
             .layout_engine
@@ -604,6 +607,7 @@ impl Reactor {
             (target, target_workspace),
             (source_screen, target_screen),
         )?;
+        self.cancel_window_presentations(moved.clone());
         for &window in &moved {
             let Some(state) = self.state.windows.window_mut(window) else {
                 continue;
