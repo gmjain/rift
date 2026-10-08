@@ -34,6 +34,7 @@ Base: upstream 0.6.9 (`659eaa5`), rebased 2026-10-08; the 0.6.8-based queue is t
 | 14 | `workspace_changed` at once when a switch only focuses another display; no repeat for a snapshot that re-confirms it | `4793b63`, `ce59646` | done |
 | 15 | built-in workspace HUD (`[settings.ui.workspace_hud]`), drawn at the switch decision | `043add6`, `a9ef97a` | done, off by default |
 | 16 | a window in one bsp leaf on one display: duplicate-leaf fix for cross-display moves | `f6a1683` to `c90c308` (6) | done |
+| 17 | HID event tap placement (`[settings] event_tap_placement`, `"head"`/`"tail"`): tail runs rift after Synergy's tap | `862d3ea`, `5778a2a` | done, head by default |
 
 - Rows 1-4 are the former local branch `wms/fixes` (base 3a99afa, v0.6.7), rebased onto
   upstream 0.6.8, then 0.6.9. Root-cause write-ups: `wms/docs/incidents/2026-10-05-rift-*.md`.
@@ -84,6 +85,17 @@ Base: upstream 0.6.9 (`659eaa5`), rebased 2026-10-08; the 0.6.8-based queue is t
   single (not animated) frame write the app answers with another frame is laid out once more.
   Upstream-worthy (issue draft in the incident doc). Review:
   `wms/docs/rift-fork-review-2026-10-06.md` (fifth pass).
+- Row 17: with `"head"` (default, upstream) rift's tap runs before every other HID tap and
+  consumes its hotkeys before Synergy can forward them to the other machine; restarting Synergy
+  put it back in front only until rift's next tap rebuild. With `"tail"` the first tap and
+  every rebuild (mask change, invalidation, failed re-enable, placement change on reload) use
+  `kCGTailAppendEventTap`: HID taps that already exist (here Synergy, openlogi-agent, FineTune)
+  and any tap another app later inserts at the head run first, and what they consume never
+  reaches rift. Trade-offs: their remaps reach rift remapped; a key or click they swallow is
+  invisible to rift (key/drag state stale until that key's or button's next event); Synergy's
+  screen edges win over `horizontal_mouse_warp`. Nothing in rift needs to run first: apps, the
+  Dock and session taps (Hammerspoon, Carbon hotkeys) follow every HID tap either way. Unit
+  tests swap `EventTap` for a recorder (`cfg(test)`). Upstream-worthy.
 - Status values: planned, in progress, done (on `main`), live (deployed), upstreamed, dropped.
 - Update this table in the same commit that changes a patch's status.
 
