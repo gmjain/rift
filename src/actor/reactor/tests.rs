@@ -10446,6 +10446,24 @@ fn frames_in(requests: &[Request], window: WindowId) -> Vec<CGRect> {
         .collect()
 }
 
+/// `simulate_until_quiet`, collecting every full frame rift asked `window`'s app to set.
+fn settle_collecting_frames(
+    apps: &mut Apps,
+    reactor: &mut Reactor,
+    window: WindowId,
+) -> Vec<CGRect> {
+    let mut frames = Vec::new();
+    let mut requests = apps.requests();
+    while !requests.is_empty() {
+        frames.extend(frames_in(&requests, window));
+        for event in apps.simulate_events_for_requests(requests) {
+            reactor.handle_event(event);
+        }
+        requests = apps.requests();
+    }
+    frames
+}
+
 fn tiled_frame(reactor: &mut Reactor, space: SpaceId, screen: CGRect, window: WindowId) -> CGRect {
     use crate::sys::geometry::Round;
     test_layout(reactor, space, screen)
@@ -10453,6 +10471,185 @@ fn tiled_frame(reactor: &mut Reactor, space: SpaceId, screen: CGRect, window: Wi
         .find(|(wid, _)| *wid == window)
         .map(|(_, frame)| frame.round())
         .unwrap_or_else(|| panic!("{window:?} is tiled on {space:?}"))
+}
+
+/// A display taller than [`left_screen`], right of it: a portrait external next to a laptop.
+fn tall_right_screen() -> CGRect { CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1600.)) }
+
+/// With global workspaces a workspace moves between displays with its layout, so one
+/// workspace comes to keep a layout per display size. A window moved to the other display
+/// while the workspace showed there was taken out of the layout for that size only; when
+/// the workspace came back, its layout for the first size still held the window. That
+/// display then kept placing the window its new display was placing too, and moving the
+/// window into the workspace again put it into a second leaf.
+#[test]
+fn a_window_moved_between_displays_tiles_in_one_leaf_on_one_display() {
+    let mut reactor = bound_reactor(global_workspace_settings(4));
+    reactor.config.settings.animate = true;
+    let (left_space, right_space) = (SpaceId::new(1), SpaceId::new(2));
+    connect_displays(&mut reactor, vec![left_screen(), tall_right_screen()], vec![
+        Some(left_space),
+        Some(right_space),
+    ]);
+    let mut apps = Apps::new();
+    apps.make_app_and_settle(&mut reactor, 1, make_windows(2));
+    let (first, second) = (WindowId::new(1, 1), WindowId::new(1, 2));
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+    assert_eq!(reactor.test_tiled_leaves(left_space), vec![first, second]);
+
+    // ws0 goes to the taller display with its layout, and gets a layout for that size.
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWorkspaceToDisplay {
+            selector: DisplaySelector::Index(1),
+            wrap_around: false,
+        },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, right_space), Some(0));
+    assert_eq!(reactor.test_tiled_leaves(right_space), vec![first, second]);
+
+    // The first window goes back to the left display, into the workspace showing there.
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWindowToDisplay {
+            selector: DisplaySelector::Index(0),
+            window_id: Some(first.idx.get()),
+        },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.assigned_space_for_window_id(first), Some(left_space));
+    assert_eq!(reactor.test_tiled_leaves(left_space), vec![first]);
+    assert_eq!(reactor.test_tiled_leaves(right_space), vec![second]);
+
+    // ws0 comes back to the left display: its layout for this size is shown again.
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWorkspaceToDisplay {
+            selector: DisplaySelector::Index(0),
+            wrap_around: false,
+        },
+    )));
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(active_workspace_index_of(&reactor, left_space), Some(0));
+    assert_eq!(reactor.space_state.command_space, Some(left_space));
+    assert_eq!(
+        reactor.test_tiled_leaves(left_space),
+        vec![second],
+        "the window moved away while ws0 showed elsewhere is not back in its layout"
+    );
+
+    // The first window joins ws0 again, on the same display.
+    reactor.handle_test_layout_command(LayoutCommand::MoveWindowToWorkspace {
+        workspace: WorkspaceSelector::Index(0),
+        follow: false,
+        window_id: Some(first.idx.get()),
+    });
+    apps.simulate_until_quiet(&mut reactor);
+    let leaves = reactor.test_tiled_leaves(left_space);
+    assert_eq!(
+        leaves.iter().filter(|wid| **wid == first).count(),
+        1,
+        "one leaf for the window: {leaves:?}"
+    );
+    assert_eq!(leaves.len(), 2);
+
+    // Moved to the other display, it gets its frames from that display alone.
+    let _ = apps.requests();
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::MoveWindowToDisplay {
+            selector: DisplaySelector::Index(1),
+            window_id: Some(first.idx.get()),
+        },
+    )));
+    let frames = settle_collecting_frames(&mut apps, &mut reactor, first);
+    assert!(!frames.is_empty());
+    assert!(
+        frames.iter().all(|frame| frame.origin.x >= 1000.),
+        "every frame after the move is on the right display: {frames:?}"
+    );
+    let expected = tiled_frame(&mut reactor, right_space, tall_right_screen(), first);
+    assert_eq!(frames.last().copied(), Some(expected));
+    assert_eq!(reactor.test_tiled_leaves(left_space), vec![second]);
+    assert!(
+        test_layout(&mut reactor, left_space, left_screen())
+            .iter()
+            .all(|(wid, _)| *wid != first),
+        "the display the window left has no frame for it"
+    );
+
+    // macOS still reports the window on the display it left; the re-sent WindowAdded
+    // neither pulls it back nor copies it.
+    let reports = vec![
+        (reactor.test_window_server_id(first), Some(left_space)),
+        (reactor.test_window_server_id(second), Some(left_space)),
+    ];
+    reactor.reconcile_authoritative_active_window_snapshot(reports, true, &[]);
+    let frames = settle_collecting_frames(&mut apps, &mut reactor, first);
+    assert!(frames.is_empty(), "nothing moves a settled window: {frames:?}");
+    assert_eq!(reactor.assigned_space_for_window_id(first), Some(right_space));
+    assert_eq!(reactor.test_tiled_leaves(left_space), vec![second]);
+}
+
+/// A new window opened on one display while the focused workspace is on the other
+/// (`new_window_display = "focused"`) ends up tiled once, on the focused display, with the
+/// frames after rift's decision all on that display.
+#[test]
+fn a_new_window_moved_to_the_focused_display_gets_one_final_frame_there() {
+    use crate::common::config::{NewWindowDisplay, VirtualWorkspaceSettings};
+    let (mut apps, mut reactor, left_space, right_space) = reactor_for_new_window_placement(
+        NewWindowDisplay::Focused,
+        VirtualWorkspaceSettings::default(),
+    );
+    reactor.config.settings.animate = true;
+    reactor.space_state.command_space = Some(right_space);
+    let _ = apps.requests();
+
+    let window = WindowId::new(1, 1002);
+    let wsid = WindowServerId::new(10002);
+    let frame = CGRect::new(CGPoint::new(200., 200.), CGSize::new(400., 400.));
+    reactor.handle_event(Event::WindowCreated(
+        window,
+        make_window_info(frame, Some(wsid), "New Window", None),
+        Some(crate::sys::window_server::WindowServerInfo {
+            id: wsid,
+            pid: 1,
+            layer: 0,
+            frame,
+            min_frame: frame.size,
+            max_frame: frame.size,
+        }),
+        None,
+    ));
+    let frames = settle_collecting_frames(&mut apps, &mut reactor, window);
+
+    assert_eq!(reactor.assigned_space_for_window_id(window), Some(right_space));
+    let expected = tiled_frame(&mut reactor, right_space, right_screen(), window);
+    assert_eq!(frames.last().copied(), Some(expected), "{frames:?}");
+    let decided = frames
+        .iter()
+        .position(|frame| frame.origin.x >= 1000.)
+        .expect("a frame on the focused display");
+    assert!(
+        frames[decided..].iter().all(|frame| frame.origin.x >= 1000.),
+        "once decided, every frame is on the focused display: {frames:?}"
+    );
+    assert_eq!(
+        reactor.test_tiled_leaves(right_space).iter().filter(|w| **w == window).count(),
+        1
+    );
+    assert!(!reactor.test_tiled_leaves(left_space).contains(&window));
+
+    // macOS lags the move: a report of the display the window opened on changes nothing.
+    let reports = vec![
+        (wsid, Some(left_space)),
+        (
+            reactor.test_window_server_id(WindowId::new(1, 1)),
+            Some(left_space),
+        ),
+    ];
+    reactor.reconcile_authoritative_active_window_snapshot(reports, true, &[]);
+    let frames = settle_collecting_frames(&mut apps, &mut reactor, window);
+    assert!(frames.is_empty(), "nothing moves a placed window: {frames:?}");
+    assert_eq!(reactor.assigned_space_for_window_id(window), Some(right_space));
+    assert!(!reactor.test_tiled_leaves(left_space).contains(&window));
 }
 
 /// macOS answers a frame request with the frame it constrained the window to (a size set

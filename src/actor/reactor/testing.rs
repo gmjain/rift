@@ -74,6 +74,17 @@ impl Reactor {
         }
     }
 
+    /// Every leaf of the layout `space` shows, in tree order and with repeats: a window
+    /// tiled in two leaves is listed twice.
+    pub fn test_tiled_leaves(&self, space: SpaceId) -> Vec<WindowId> {
+        use crate::layout_engine::LayoutSystem;
+        let workspaces = self.layout_manager.layout_engine.workspaces();
+        let Some((workspace, layout)) = workspaces.active_layout_for_space(space) else {
+            return Vec::new();
+        };
+        workspaces.workspaces[workspace].layout_system.all_windows_in_layout(layout)
+    }
+
     pub fn test_active_workspace_windows(&self, space: SpaceId) -> Vec<WindowId> {
         self.layout_manager
             .layout_engine
